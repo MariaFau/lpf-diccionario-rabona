@@ -1,0 +1,947 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>La Rabona</title>
+<style>
+  :root { --ink: #e9e5dc; --dim: #7f858c; --gold: #c9a24a; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: var(--ink);
+    font: 13px/1.4 "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.05em;
+  }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; overflow: hidden;
+  }
+  .stage { width: min(100%, calc((100vh - 90px) * 16 / 9)); aspect-ratio: 16 / 9; }
+  canvas { display: block; width: 100%; height: 100%; background: #000; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--dim);
+    width: min(100%, calc((100vh - 90px) * 16 / 9));
+  }
+  .controls button {
+    background: none; border: 1px solid #2e3338; color: var(--ink); padding: 5px 10px;
+    font: inherit; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+  }
+  .controls button[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }
+  .controls input[type=range] { flex: 1; min-width: 160px; accent-color: #56708c; }
+  .controls .t { font-variant-numeric: tabular-nums; min-width: 52px; color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="stage"><canvas id="c" width="1280" height="720"></canvas></div>
+<div class="controls">
+  <button id="play" aria-pressed="true">Pause</button>
+  <button id="slow" aria-pressed="false">0.25×</button>
+  <button id="debug" aria-pressed="false">Joints</button>
+  <input id="scrub" type="range" min="0" max="2.4" step="0.001" value="0">
+  <span class="t" id="tlabel">0.00 s</span>
+  <span>space · ← →</span>
+</div>
+<script>
+(() => {
+  'use strict';
+
+  // =================================================================
+  //  STAGE — 1280x720, static camera, three-quarter side view.
+  //  The player faces screen-left. Left-footed rabona:
+  //    SUPPORT leg = player's right leg (screen-left), foot planted.
+  //    KICK leg    = player's left leg (screen-right), crosses BEHIND.
+  // =================================================================
+  const W = 1280, H = 720;
+  const GROUND_Y = 620;
+  const DURATION = 2.4;
+  const LOOP_HOLD = 0.8;
+  const T_CONTACT = 1.60;
+
+  const V = (x, y) => ({ x, y });
+  const add = (a, b) => V(a.x + b.x, a.y + b.y);
+  const sub = (a, b) => V(a.x - b.x, a.y - b.y);
+  const mul = (a, s) => V(a.x * s, a.y * s);
+  const len = a => Math.hypot(a.x, a.y);
+  const norm = a => { const l = len(a) || 1; return V(a.x / l, a.y / l); };
+  const angle = a => Math.atan2(a.y, a.x);
+
+  const THIGH = 112, SHIN = 112;           // leg segment lengths (both legs)
+  const HIP_HALF = 22.7;                   // half pelvis width
+  const HEAD_S = 1.22;                     // head drawing scale (≈7 heads tall)
+  const VIEW_S = 1.18;                     // fixed framing: world scale about the planted foot
+  const VIEW_PIVOT = V(640, 620);
+  const SUPPORT_FOOT = V(616.7, 600);      // ankle — never moves
+  const SUPPORT_TOE = V(-54, 14.4);        // boot direction (ankle → toe tip)
+  const BALL_REST = V(472, 593);
+  const BALL_R = 27;                       // natural size vs. a ~490 px player
+
+  // =================================================================
+  //  KEYFRAMES. Kick leg = explicit knee + ankle waypoints (not a hip
+  //  rotation). From poseApproach to poseFollow the kick ankle travels on
+  //  ONE straight strike line: behind the support shin → out on the ball
+  //  side → into the ball.
+  //
+  //  pelvis, neck      torso
+  //  kKnee, kAnk, kToe kick leg (kToe = ankle → toe-tip vector)
+  //  fEl, fHa          far arm (player's left)   elbow / hand
+  //  nEl, nHa          near arm (player's right) elbow / hand
+  //  Support knee is solved by IK from the pinned support foot.
+  // =================================================================
+  const poseA = {        // PREPARATION: planted, kick leg on its own side
+    pelvis: V(646.7, 390.0), neck: V(634.7, 240.0), kHipOff: V(22.7, 0),
+    kKnee: V(698.7, 494.7), kAnk: V(738.7, 592.0), kToe: V(-39.6, 23.4),
+    fEl: V(680, 300), fHa: V(690, 346), nEl: V(598, 300), nHa: V(592, 348),
+  };
+  const poseLift = {     // heel rises behind the body
+    pelvis: V(648.0, 393.3), neck: V(640.0, 242.7), kHipOff: V(20, 0),
+    kKnee: V(710.7, 480.0), kAnk: V(797.3, 521.3), kToe: V(-12.6, 46.8),
+    fEl: V(700, 288), fHa: V(732, 312), nEl: V(588, 292), nHa: V(560, 328),
+  };
+  const poseApproach = { // ankle reaches the back of the support shin
+    pelvis: V(649.3, 395.3), neck: V(644.0, 244.0), kHipOff: V(12, 0),
+    kKnee: V(690.7, 481.3), kAnk: V(646.7, 540.5), kToe: V(-39.6, 34.2),
+    fEl: V(708, 284), fHa: V(746, 296), nEl: V(582, 290), nHa: V(546, 318),
+  };
+  const poseB = {        // CROSSING: kick ankle directly BEHIND the support shin
+    pelvis: V(650.0, 396.7), neck: V(645.3, 244.7), kHipOff: V(4, 0),
+    kKnee: V(660.0, 490.0), kAnk: V(606.7, 558.5), kToe: V(-45.0, 25.2),
+    fEl: V(711, 282), fHa: V(752, 288), nEl: V(580, 290), nHa: V(542, 314),
+  };
+  const poseC = {        // CROSSED: shins form an X, boot out on the ball side
+    pelvis: V(650.7, 397.3), neck: V(646.7, 245.3), kHipOff: V(0, 0),
+    kKnee: V(643.3, 501.3), kAnk: V(573.3, 573.5), kToe: V(-48.6, 21.6),
+    fEl: V(713, 281), fHa: V(755, 285), nEl: V(579, 290), nHa: V(540, 312),
+  };
+  const poseContact = {  // the same foot, on the same line, meets the ball
+    pelvis: V(649.3, 399.3), neck: V(646.0, 246.7), kHipOff: V(-4, 0),
+    kKnee: V(630.0, 510.0), kAnk: V(544.0, 586.7), kToe: V(-48.6, 19.8),
+    fEl: V(714, 284), fHa: V(756, 292), nEl: V(578, 293), nHa: V(538, 318),
+  };
+  const poseFollow = {
+    pelvis: V(648.0, 399.3), neck: V(644.7, 246.7), kHipOff: V(-4, 0),
+    kKnee: V(624.0, 512.0), kAnk: V(530.0, 590.0), kToe: V(-48.6, 16.2),
+    fEl: V(710, 288), fHa: V(750, 302), nEl: V(582, 296), nHa: V(546, 326),
+  };
+  const poseSettle = {
+    pelvis: V(646.7, 398.7), neck: V(643.3, 246.0), kHipOff: V(0, 0),
+    kKnee: V(622.7, 508.0), kAnk: V(532.0, 584.0), kToe: V(-49.5, 9.0),
+    fEl: V(704, 292), fHa: V(740, 312), nEl: V(588, 300), nHa: V(556, 334),
+  };
+
+  // flat = zero velocity at that key (a hold)
+  const KEYS = [
+    { t: 0.00, pose: poseA, flat: true },
+    { t: 0.45, pose: poseA, flat: true },      // 0.00–0.45 preparation
+    { t: 0.62, pose: poseLift },
+    { t: 0.86, pose: poseApproach },
+    { t: 0.98, pose: poseB },                  // passing behind the support shin
+    { t: 1.10, pose: poseC, flat: true },      // 1.10–1.35 crossed hold
+    { t: 1.35, pose: poseC, flat: true },
+    { t: 1.60, pose: poseContact },            // contact
+    { t: 1.85, pose: poseFollow },
+    { t: 2.40, pose: poseSettle, flat: true },
+  ];
+  const FIELDS = Object.keys(poseA);
+
+  // Non-uniform Catmull-Rom (cubic Hermite) through the keys.
+  function tangent(i, f, ax) {
+    const k = KEYS[i];
+    if (k.flat || i === 0 || i === KEYS.length - 1) return 0;
+    return (KEYS[i + 1].pose[f][ax] - KEYS[i - 1].pose[f][ax]) / (KEYS[i + 1].t - KEYS[i - 1].t);
+  }
+  function hermite(p0, p1, m0, m1, dt, u) {
+    const u2 = u * u, u3 = u2 * u;
+    return (2*u3 - 3*u2 + 1) * p0 + (u3 - 2*u2 + u) * dt * m0 + (-2*u3 + 3*u2) * p1 + (u3 - u2) * dt * m1;
+  }
+  function twoBoneIK(a, b, l1, l2, bend) {
+    const d = sub(b, a), dist = Math.min(len(d), l1 + l2 - 0.01), dir = norm(d);
+    const x = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist);
+    const h = Math.sqrt(Math.max(0, l1 * l1 - x * x));
+    return add(add(a, mul(dir, x)), V(-dir.y * h * bend, dir.x * h * bend));
+  }
+
+  // Kick knee solve. Exact thigh/shin lengths whenever the keyframed knee
+  // is clearly on one side of the hip→ankle line; while it turns through
+  // that line (hip rotation: the knee points at the camera) the leg
+  // foreshortens smoothly instead of flipping. Continuous; never stretches.
+  const KNEE_SOFT = 22;
+  function constrainKnee(hip, knee, ank) {
+    const d = sub(ank, hip), dist = Math.min(len(d), THIGH + SHIN - 0.01), dir = norm(d);
+    const perp = V(-dir.y, dir.x);
+    const a = (THIGH * THIGH - SHIN * SHIN + dist * dist) / (2 * dist);
+    const hFull = Math.sqrt(Math.max(0, THIGH * THIGH - a * a));
+    const e = (knee.x - hip.x) * perp.x + (knee.y - hip.y) * perp.y;       // keyed side + distance
+    const k = Math.max(-1, Math.min(1, e / KNEE_SOFT));
+    return add(add(hip, mul(dir, a)), mul(perp, hFull * k));
+  }
+
+  function sampleRig(t) {
+    t = Math.max(0, Math.min(DURATION, t));
+    let i = 0;
+    while (i < KEYS.length - 2 && t > KEYS[i + 1].t) i++;
+    const a = KEYS[i], b = KEYS[i + 1], dt = b.t - a.t, u = dt > 0 ? (t - a.t) / dt : 0;
+    const r = {};
+    for (const f of FIELDS) r[f] = V(
+      hermite(a.pose[f].x, b.pose[f].x, tangent(i, f, 'x'), tangent(i + 1, f, 'x'), dt, u),
+      hermite(a.pose[f].y, b.pose[f].y, tangent(i, f, 'y'), tangent(i + 1, f, 'y'), dt, u));
+    // derived joints
+    const tilt = (r.pelvis.y - 390) * 0.004;
+    const across = V(Math.cos(tilt), Math.sin(tilt));
+    r.sHip = sub(r.pelvis, mul(across, HIP_HALF));
+    r.kHip = add(r.pelvis, mul(across, r.kHipOff.x));   // kick hip rotates in behind as the leg crosses
+    r.sFoot = { ...SUPPORT_FOOT };                       // PINNED
+    r.sToe = SUPPORT_TOE;
+    r.sKnee = twoBoneIK(r.sHip, r.sFoot, THIGH, SHIN, 1); // knee bends forward (screen-left)
+    // Kick knee: keyframed, then constrained to real limb lengths
+    // (foreshortening allowed, stretching not). The ankle path is exact.
+    r.kKneeKey = r.kKnee;
+    r.kKnee = constrainKnee(r.kHip, r.kKnee, r.kAnk);
+    r.spine = norm(sub(r.neck, r.pelvis));
+    r.right = V(-r.spine.y, r.spine.x);                  // screen-right across the torso
+    r.fSh = add(r.neck, add(mul(r.right, 27), mul(r.spine, -12)));
+    r.nSh = add(r.neck, add(mul(r.right, -25), mul(r.spine, -10)));
+    r.head = add(r.neck, V(-17, -41));
+    r.headTilt = -0.30 - (r.pelvis.y - 390) * 0.004;    // chin down, eyes on the ball
+    // names used by the brief
+    r.shoulder = r.neck; r.hip = r.pelvis;
+    r.supportKnee = r.sKnee; r.supportFoot = r.sFoot; r.kickKnee = r.kKnee; r.kickFoot = r.kAnk;
+    return r;
+  }
+
+  function ballState(t) {
+    if (t <= T_CONTACT) return { x: BALL_REST.x, y: BALL_REST.y, rot: 0, squash: 0, moving: false };
+    const p = Math.min(1, (t - T_CONTACT) / (DURATION - T_CONTACT));
+    const e = 1 - Math.pow(1 - p, 1.7);
+    return {
+      x: BALL_REST.x - 330 * e,
+      y: BALL_REST.y - 150 * Math.sin(e * Math.PI * 0.7),
+      rot: -e * 9,
+      squash: Math.max(0, 1 - (t - T_CONTACT) / 0.06) * 0.16,
+      moving: true,
+    };
+  }
+
+  // =================================================================
+  //  INK + TEXTURE UTILITIES
+  // =================================================================
+  const INK = '#050505';
+  const C = {
+    paper: '#ece8df', pale: '#cfcbc2', mid: '#8f8b85', dark: '#26282b',
+    skin: '#a8988a', skinLit: '#d2c6b8', skinShadow: '#3b322d',
+    shirt: '#dedad1', stripe: '#7f96ab', shirtShadow: '#1d242c',
+    shorts: '#101318', shortsFold: '#4a5563',
+    sock: '#121417', sockLit: '#5e6873', sockBand: '#d9d5cc', hoop: '#6f88a0',
+    boot: '#0b0b0c', bootLit: '#9aa1a8', lace: '#d9d5cc',
+    blue: '#56708c', blueDeep: '#1b2633', gold: '#c9a24a',
+  };
+  function hex(c) { const n = parseInt(c.slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
+  function mix(a, b, t) {
+    const A = hex(a), B = hex(b);
+    return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * t).toString(16).padStart(2, '0')).join('');
+  }
+  // The far (kick) leg sits in shadow: every colour pushed toward deep blue-black.
+  function shadeStyle(s, amount) {
+    const o = {};
+    for (const k in s) o[k] = typeof s[k] === 'string' && s[k][0] === '#' ? mix(s[k], '#070b12', amount) : s[k];
+    return o;
+  }
+
+  // Seeded jitter so ink edges are irregular but stable from frame to frame.
+  function jitter(seed, i) {
+    const x = Math.sin(seed * 127.1 + i * 311.7) * 43758.5453;
+    return x - Math.floor(x) - 0.5;
+  }
+  // Smooth closed/open path through points with hand-inked irregularity.
+  function inkPath(g, pts, seed, amp = 0.8, closed = true) {
+    const P = pts.map((p, i) => V(p[0] + jitter(seed, i) * amp, p[1] + jitter(seed + 7, i) * amp));
+    g.beginPath();
+    if (closed) {
+      const m0 = V((P[P.length - 1].x + P[0].x) / 2, (P[P.length - 1].y + P[0].y) / 2);
+      g.moveTo(m0.x, m0.y);
+      for (let i = 0; i < P.length; i++) {
+        const p = P[i], q = P[(i + 1) % P.length];
+        g.quadraticCurveTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2);
+      }
+      g.closePath();
+    } else {
+      g.moveTo(P[0].x, P[0].y);
+      for (let i = 1; i < P.length - 1; i++) {
+        g.quadraticCurveTo(P[i].x, P[i].y, (P[i].x + P[i + 1].x) / 2, (P[i].y + P[i + 1].y) / 2);
+      }
+      g.lineTo(P[P.length - 1].x, P[P.length - 1].y);
+    }
+  }
+  // Ink outline: a firm stroke plus a thinner, offset pass for a brushy edge.
+  function inkStroke(g, w = 2.4, color = INK) {
+    g.lineJoin = 'round'; g.lineCap = 'round';
+    g.strokeStyle = color; g.lineWidth = w; g.stroke();
+    g.save(); g.translate(0.7, 0.5); g.globalAlpha *= 0.55; g.lineWidth = w * 0.45; g.stroke(); g.restore();
+  }
+  // Parallel hatching inside the current clip, in local coordinates.
+  function hatch(g, x0, y0, x1, y1, step, slope, color, lw, seed = 1) {
+    g.strokeStyle = color; g.lineWidth = lw; g.lineCap = 'round';
+    for (let x = x0 - (y1 - y0) * Math.abs(slope); x < x1; x += step) {
+      const j = jitter(seed, x) * step * 0.4;
+      g.beginPath(); g.moveTo(x + j, y0); g.lineTo(x + j + (y1 - y0) * slope, y1); g.stroke();
+    }
+  }
+  function inFrame(g, origin, ang, fn) {
+    g.save(); g.translate(origin.x, origin.y); g.rotate(ang); fn(); g.restore();
+  }
+
+  // =================================================================
+  //  CHARACTER PARTS
+  //  Limbs are drawn in a local frame: x runs along the bone from the
+  //  proximal to the distal joint; `ant` (+1/-1) says which local y side is
+  //  anterior (front of the leg, facing the key light, screen-left).
+  // =================================================================
+  const LEG_STYLE = {
+    skin: C.skin, skinLit: C.skinLit, skinShadow: C.skinShadow,
+    sock: C.sock, sockLit: C.sockLit, sockBand: C.sockBand, hoop: C.hoop,
+    boot: C.boot, bootLit: C.bootLit, lace: C.lace,
+    shorts: C.shorts, shortsFold: C.shortsFold, ink: INK,
+  };
+  const KICK_STYLE = { ...shadeStyle(LEG_STYLE, 0.32), ink: '#4f6983' };   // far leg: cool rim-lit edge
+
+  function anteriorSign(hip, knee, toeVec) {
+    const d = norm(sub(knee, hip)), n = V(-d.y, d.x);
+    return (n.x * toeVec.x + n.y * toeVec.y) >= 0 ? 1 : -1;
+  }
+
+  function thighPts(L, a) {
+    return [[-8, a * 17], [0.22 * L, a * 22.5], [0.5 * L, a * 20.5], [0.8 * L, a * 14.5], [L, a * 11.5],
+            [L + 8, 0], [L, -a * 11.5], [0.72 * L, -a * 14], [0.42 * L, -a * 19.5], [0.12 * L, -a * 20.5],
+            [-8, -a * 17], [-14, 0]];
+  }
+  function shinPts(L, a) {
+    return [[-5, a * 11.5], [0.3 * L, a * 11], [0.7 * L, a * 8.2], [L, a * 6.8], [L + 5, 0],
+            [L, -a * 7.2], [0.72 * L, -a * 10], [0.36 * L, -a * 16.5], [0.12 * L, -a * 13.5],
+            [-5, -a * 11.5], [-10, 0]];
+  }
+
+  // drawLeg(): thigh + lower leg (skin, knee, calf volume). Socks and boots
+  // are added by drawSock() and drawBoot().
+  function drawLeg(g, hip, knee, ank, toeVec, st, seed, mode) {
+    const a = anteriorSign(hip, knee, toeVec);
+    const Lt = len(sub(knee, hip)), Ls = len(sub(ank, knee));
+    const at = angle(sub(knee, hip)), as = angle(sub(ank, knee));
+    if (mode === 'silhouette' || mode === 'knockout') {
+      const paint = () => {
+        if (mode === 'silhouette') { g.fillStyle = '#000'; g.fill(); }
+        else { g.strokeStyle = '#000'; g.lineWidth = 9; g.lineJoin = 'round'; g.stroke(); }
+      };
+      inFrame(g, hip, at, () => { inkPath(g, thighPts(Lt, a), seed); paint(); });
+      inFrame(g, knee, as, () => { inkPath(g, shinPts(Ls, a), seed + 1); paint(); });
+      drawBoot(g, ank, toeVec, knee, st, seed + 3, mode);
+      return;
+    }
+    // THIGH
+    inFrame(g, hip, at, () => {
+      inkPath(g, thighPts(Lt, a), seed);
+      g.fillStyle = st.skin; g.fill();
+      g.save(); g.clip();
+      g.fillStyle = st.skinShadow;                       // posterior in shadow
+      g.fillRect(-20, a > 0 ? -30 : 2, Lt + 30, 28);
+      g.fillStyle = st.skinLit;                          // lit front edge
+      inkPath(g, [[0.1 * Lt, a * 17], [0.5 * Lt, a * 17], [0.85 * Lt, a * 12], [0.85 * Lt, a * 8], [0.5 * Lt, a * 12], [0.1 * Lt, a * 12]], seed + 11, 0.6);
+      g.fill();
+      g.restore();
+      hatch2(g, thighPts(Lt, a), seed, () => hatch(g, 0, a > 0 ? -22 : 4, Lt, a > 0 ? -4 : 22, 4.5, 0.5, 'rgba(0,0,0,0.55)', 1));
+      // quad / knee lines
+      inkPath(g, [[0.3 * Lt, a * 6], [0.6 * Lt, a * 3], [0.86 * Lt, a * 5]], seed + 5, 0.5, false);
+      g.lineWidth = 1.2; g.strokeStyle = 'rgba(0,0,0,0.7)'; g.stroke();
+      inkPath(g, thighPts(Lt, a), seed); inkStroke(g, 2.4, st.ink);
+    });
+    // LOWER LEG (knee skin; drawSock covers the shin)
+    inFrame(g, knee, as, () => {
+      inkPath(g, shinPts(Ls, a), seed + 1);
+      g.fillStyle = st.skin; g.fill();
+      g.save(); g.clip();
+      g.fillStyle = st.skinShadow; g.fillRect(-12, a > 0 ? -20 : 2, 24, 18);
+      g.restore();
+    });
+    drawSock(g, knee, ank, a, st, seed + 2);
+    drawBoot(g, ank, toeVec, knee, st, seed + 3);
+  }
+  function hatch2(g, pts, seed, fn) {
+    g.save(); inkPath(g, pts, seed); g.clip(); fn(); g.restore();
+  }
+
+  // drawSock(): long 1940s wool sock with a turned-down hooped band.
+  function drawSock(g, knee, ank, a, st, seed) {
+    const L = len(sub(ank, knee));
+    inFrame(g, knee, angle(sub(ank, knee)), () => {
+      const s0 = 0.13 * L;
+      const pts = shinPts(L, a).filter(p => p[0] >= 0.1 * L);
+      const sock = [[s0, a * 11.6], ...pts.filter(p => p[1] * a > 0 && p[0] > s0), [L + 5, 0],
+                    ...pts.filter(p => p[1] * a < 0 && p[0] > s0), [s0, -a * 14.4]];
+      inkPath(g, sock, seed, 0.6);
+      g.fillStyle = st.sock; g.fill();
+      g.save(); g.clip();
+      // wool ribbing
+      g.strokeStyle = 'rgba(255,255,255,0.06)'; g.lineWidth = 1;
+      for (let y = -14; y <= 14; y += 3) { g.beginPath(); g.moveTo(s0, y); g.lineTo(L + 6, y * 0.55); g.stroke(); }
+      // volume: lit front strip, darker calf
+      g.fillStyle = st.sockLit;
+      inkPath(g, [[s0 + 8, a * 9], [0.7 * L, a * 6.5], [L - 4, a * 5], [L - 4, a * 3], [0.7 * L, a * 4], [s0 + 8, a * 6]], seed + 4, 0.5);
+      g.fill();
+      g.restore();
+      // turned-down band with two hoops
+      const b0 = 0.1 * L, b1 = 0.29 * L;
+      const band = [[b0, a * 13.2], [b1, a * 12], [b1 + 2, 0], [b1, -a * 17], [b0, -a * 15], [b0 - 3, 0]];
+      inkPath(g, band, seed + 6, 0.7);
+      g.fillStyle = st.sockBand; g.fill();
+      g.save(); g.clip();
+      g.fillStyle = st.hoop;
+      g.fillRect(b0 + (b1 - b0) * 0.3, -20, (b1 - b0) * 0.16, 40);
+      g.fillRect(b0 + (b1 - b0) * 0.62, -20, (b1 - b0) * 0.16, 40);
+      g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(b0 - 4, a > 0 ? -20 : 3, b1 - b0 + 8, 17);   // band shadow side
+      g.restore();
+      inkPath(g, band, seed + 6, 0.7); inkStroke(g, 2, st.ink);
+      inkPath(g, sock, seed, 0.6); inkStroke(g, 2.3, st.ink);
+    });
+  }
+
+  // drawBoot(): high-cut 1940s leather boot. Local frame: origin at the
+  // ankle, x along the toe vector; the frontmost point is EXACTLY the toe tip.
+  function bootPts(Lf) {
+    return [[-11, -19], [6, -20], [9, -13], [0.5 * Lf, -9.5], [Lf - 9, -5], [Lf - 1, -2.5], [Lf, 1.5],
+            [Lf - 3, 7], [Lf - 12, 10], [0.3 * Lf, 12], [-13, 12.5], [-18, 7], [-17, -4], [-13, -12]];
+  }
+  function drawBoot(g, ank, toeVec, knee, st, seed, mode) {
+    const Lf = len(toeVec), u = norm(toeVec);
+    // sole side = away from the knee
+    let n = V(-u.y, u.x);
+    const k = sub(knee, ank);
+    if (n.x * k.x + n.y * k.y > 0) n = V(-n.x, -n.y);
+    const flip = (u.x * n.y - u.y * n.x) < 0;           // mirror so local +y is the sole
+    g.save();
+    g.translate(ank.x, ank.y);
+    g.rotate(angle(u));
+    if (flip) g.scale(1, -1);
+    const pts = bootPts(Lf);
+    if (mode === 'silhouette') { inkPath(g, pts, seed); g.fillStyle = '#000'; g.fill(); g.restore(); return; }
+    if (mode === 'knockout') {
+      inkPath(g, pts, seed); g.strokeStyle = '#000'; g.lineWidth = 9; g.lineJoin = 'round'; g.stroke();
+      g.restore(); return;
+    }
+    // sole + studs
+    g.fillStyle = st.ink;
+    inkPath(g, [[-14, 10], [Lf - 8, 8], [Lf - 10, 14], [-14, 15.5]], seed + 9, 0.4); g.fill();
+    for (const x of [-9, 0.35 * Lf, 0.72 * Lf]) g.fillRect(x - 3, 13.5, 6, 4.5);
+    // upper
+    inkPath(g, pts, seed);
+    g.fillStyle = st.boot; g.fill();
+    g.save(); g.clip();
+    // leather highlights: toe cap and instep
+    g.fillStyle = st.bootLit;
+    g.globalAlpha = 0.85;
+    inkPath(g, [[Lf - 14, -4], [Lf - 4, -2], [Lf - 3, 2], [Lf - 12, 0]], seed + 2, 0.4); g.fill();
+    inkPath(g, [[2, -15], [0.45 * Lf, -9.5], [0.45 * Lf, -7.5], [4, -12.5]], seed + 3, 0.4); g.fill();
+    g.globalAlpha = 1;
+    // toe-cap seam
+    g.beginPath(); g.moveTo(Lf - 16, -5); g.quadraticCurveTo(Lf - 13, 3, Lf - 16, 10);
+    g.strokeStyle = 'rgba(255,255,255,0.22)'; g.lineWidth = 1; g.stroke();
+    g.restore();
+    inkPath(g, pts, seed); inkStroke(g, 2.2, st.ink);
+    // laces
+    g.strokeStyle = st.lace; g.globalAlpha = 0.75; g.lineWidth = 1.1;
+    for (let i = 0; i < 4; i++) {
+      const x = 2 + i * (0.12 * Lf), y = -14.5 + i * 1.6;
+      g.beginPath(); g.moveTo(x - 2.5, y - 1.5); g.lineTo(x + 3, y + 2.5); g.moveTo(x + 3, y - 1.5); g.lineTo(x - 2.5, y + 2.5); g.stroke();
+    }
+    g.globalAlpha = 1;
+    g.restore();
+  }
+
+  // Shorts: one tube per thigh (drawn with its leg) + a waist block.
+  function shortsTubePts(L, a) {
+    return [[-18, a * 23], [0.2 * L, a * 25], [0.5 * L, a * 25], [0.53 * L, a * 6], [0.49 * L, -a * 23.5],
+            [0.2 * L, -a * 24], [-18, -a * 23]];
+  }
+  function drawShortsTube(g, hip, knee, toeVec, st, seed) {
+    const a = anteriorSign(hip, knee, toeVec), L = len(sub(knee, hip));
+    inFrame(g, hip, angle(sub(knee, hip)), () => {
+      const pts = shortsTubePts(L, a);
+      inkPath(g, pts, seed, 0.9);
+      g.fillStyle = st.shorts; g.fill();
+      g.save(); g.clip();
+      // folds catching the light on the front
+      g.strokeStyle = st.shortsFold; g.lineWidth = 1.6;
+      for (let i = 0; i < 3; i++) {
+        g.beginPath(); g.moveTo(0.05 * L + i * 9, a * (20 - i * 5)); g.quadraticCurveTo(0.25 * L + i * 6, a * (12 - i * 4), 0.42 * L, a * (18 - i * 7)); g.stroke();
+      }
+      g.restore();
+      inkPath(g, pts, seed, 0.9); inkStroke(g, 2.3, st.ink);
+    });
+  }
+
+  // Torso frame helpers: (r, u) = (across to screen-right, up the spine).
+  function torsoFrame(g, r, fn) {
+    g.save(); g.translate(r.pelvis.x, r.pelvis.y); g.rotate(angle(r.right)); fn(len(sub(r.neck, r.pelvis))); g.restore();
+  }
+  const TU = (x, u) => [x, -u];
+
+  function shirtPts(Ht) {
+    return [TU(-27, 22), TU(-33, 0.36 * Ht), TU(-37, 0.62 * Ht), TU(-38, 0.84 * Ht), TU(-31, Ht - 1),
+            TU(-13, Ht + 6), TU(10, Ht + 5), TU(29, Ht - 5), TU(37, 0.8 * Ht), TU(34, 0.48 * Ht),
+            TU(31, 22), TU(2, 18)];
+  }
+  // drawTorso(): body mass + shading; drawShirt(): stripes, collar, lacing.
+  function drawTorso(g, r) {
+    torsoFrame(g, r, Ht => {
+      const pts = shirtPts(Ht);
+      inkPath(g, pts, 21, 1);
+      g.fillStyle = C.shirt; g.fill();
+    });
+  }
+  function drawShirt(g, r) {
+    torsoFrame(g, r, Ht => {
+      const pts = shirtPts(Ht);
+      g.save(); inkPath(g, pts, 21, 1); g.clip();
+      // vertical stripes (desaturated sky blue)
+      g.fillStyle = C.stripe;
+      for (let x = -40; x <= 40; x += 12) g.fillRect(x, -Ht - 12, 5, Ht + 20);
+      // big graphic shadow on the back half (away from the key light)
+      const shadow = [TU(4, 12), TU(9, 0.35 * Ht), TU(5, 0.62 * Ht), TU(10, Ht + 10), TU(50, Ht + 10), TU(50, 12)];
+      inkPath(g, shadow, 23, 2.5);
+      g.fillStyle = 'rgba(6,8,12,0.9)'; g.fill();
+      // hatched half-tone only along the terminator
+      g.save();
+      inkPath(g, [TU(-8, 14), TU(-3, 0.4 * Ht), TU(-8, 0.66 * Ht), TU(-2, Ht + 8), TU(12, Ht + 8), TU(8, 0.62 * Ht), TU(12, 0.35 * Ht), TU(7, 14)], 29, 1.5);
+      g.clip();
+      hatch(g, -12, -Ht - 10, 16, -8, 3.6, 0.35, 'rgba(0,0,0,0.6)', 1, 3);
+      g.restore();
+      // cloth folds (ink, varying weight)
+      g.strokeStyle = 'rgba(0,0,0,0.65)'; g.lineWidth = 1.6;
+      inkPath(g, [TU(-31, 30), TU(-19, 42), TU(-6, 38)], 24, 1.2, false); g.stroke();
+      inkPath(g, [TU(-35, 0.58 * Ht), TU(-24, 0.52 * Ht), TU(-12, 0.57 * Ht)], 25, 1.2, false); g.stroke();
+      g.lineWidth = 1.1;
+      inkPath(g, [TU(-28, 0.78 * Ht), TU(-18, 0.74 * Ht)], 30, 0.8, false); g.stroke();
+      // lit chest edge
+      g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = 2.2;
+      inkPath(g, [TU(-33, 0.38 * Ht), TU(-36, 0.64 * Ht), TU(-35, 0.84 * Ht)], 26, 0.8, false); g.stroke();
+      g.restore();
+      inkPath(g, pts, 21, 1); inkStroke(g, 2.8);
+      // wide 1940s collar with a laced neck
+      g.fillStyle = C.paper;
+      inkPath(g, [TU(-17, Ht + 6), TU(-27, Ht - 16), TU(-4, Ht - 6)], 27, 0.5); g.fill(); inkStroke(g, 2.1);
+      inkPath(g, [TU(3, Ht - 6), TU(19, Ht - 16), TU(13, Ht + 5)], 28, 0.5); g.fill();
+      g.save(); g.clip(); g.fillStyle = 'rgba(0,0,0,0.6)'; g.fillRect(8, -Ht - 10, 20, 30); g.restore();
+      inkPath(g, [TU(3, Ht - 6), TU(19, Ht - 16), TU(13, Ht + 5)], 28, 0.5); inkStroke(g, 2.1);
+      g.beginPath(); g.moveTo(-5, -(Ht - 6)); g.lineTo(-1, -(Ht - 36)); g.lineTo(3, -(Ht - 6));
+      g.strokeStyle = INK; g.lineWidth = 2; g.stroke();
+      g.strokeStyle = C.paper; g.lineWidth = 1.1;
+      for (let i = 0; i < 3; i++) {
+        const y = -(Ht - 11 - i * 8);
+        g.beginPath(); g.moveTo(-4 + i * 1.2, y); g.lineTo(2 - i * 1.2, y - 3); g.stroke();
+      }
+    });
+  }
+  function drawShortsWaist(g, r) {
+    torsoFrame(g, r, () => {
+      const pts = [TU(-31, 32), TU(33, 32), TU(35, 8), TU(24, -6), TU(0, -12), TU(-24, -6), TU(-33, 8)];
+      inkPath(g, pts, 31, 1);
+      g.fillStyle = C.shorts; g.fill();
+      g.save(); g.clip();
+      g.fillStyle = 'rgba(255,255,255,0.08)'; g.fillRect(-40, -32, 80, 6);      // waistband
+      g.strokeStyle = C.shortsFold; g.lineWidth = 1.6;
+      inkPath(g, [TU(-26, 24), TU(-16, 8), TU(-18, -6)], 32, 1, false); g.stroke();
+      inkPath(g, [TU(-8, 26), TU(-2, 10), TU(-4, -10)], 33, 1, false); g.stroke();
+      g.restore();
+      inkPath(g, pts, 31, 1); inkStroke(g, 2.5);
+      g.beginPath(); g.moveTo(-31, -26); g.lineTo(33, -26); g.strokeStyle = INK; g.lineWidth = 1.5; g.stroke();
+    });
+  }
+
+  // drawArm(): long 1940s sleeve (stripes run down the arm), buttoned cuff, hand.
+  function drawArm(g, sh, el, ha, far, seed) {
+    const shade = far ? 0.55 : 0;
+    const cloth = mix(C.shirt, '#070b12', shade), stripe = mix(C.stripe, '#070b12', shade);
+    const skin = mix(C.skin, '#070b12', shade), skinDk = mix(C.skinShadow, '#070b12', shade);
+    const lineC = far ? '#2c3d4f' : INK;
+    const Lu = len(sub(el, sh)), Lf = len(sub(ha, el));
+    // hand
+    inFrame(g, ha, angle(sub(ha, el)), () => {
+      const hand = [[-4, -6.5], [6, -8], [12, -5], [14, 0], [11, 5], [3, 7.5], [-4, 6.5]];
+      inkPath(g, hand, seed + 1, 0.5); g.fillStyle = skin; g.fill();
+      g.save(); g.clip(); g.fillStyle = skinDk; g.fillRect(-6, 1, 22, 10); g.restore();
+      inkPath(g, hand, seed + 1, 0.5); inkStroke(g, 1.9, lineC);
+      g.strokeStyle = lineC; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(7, -1); g.lineTo(12, 0); g.moveTo(6, 2.5); g.lineTo(10.5, 3.5); g.stroke();
+      g.lineWidth = 2; g.beginPath(); g.moveTo(1, -6); g.quadraticCurveTo(6, -11, 10, -9); g.stroke();   // thumb
+    });
+    const sleeve = (L, w0, w1, sd) => [[-6, w0], [0.5 * L, (w0 + w1) / 2 + 0.8], [L + 1, w1], [L + 4, 0],
+                                       [L + 1, -w1], [0.5 * L, -(w0 + w1) / 2], [-6, -w0], [-11, 0]];
+    const paintSleeve = (L, pts, sd, cuff) => {
+      inkPath(g, pts, sd, 0.7); g.fillStyle = cloth; g.fill();
+      g.save(); g.clip();
+      g.fillStyle = stripe;
+      for (let y = -16; y <= 16; y += 8.5) g.fillRect(-14, y, L + 22, 3.4);
+      g.fillStyle = 'rgba(6,8,12,0.82)'; g.fillRect(-14, 0.5, L + 22, 18);              // underside shadow
+      g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 1.2;                            // fabric folds
+      for (let i = 1; i <= 2; i++) { g.beginPath(); g.moveTo(L * i / 3, -9); g.quadraticCurveTo(L * i / 3 + 5, -2, L * i / 3 - 2, 6); g.stroke(); }
+      if (cuff) { g.fillStyle = far ? mix(C.paper, '#070b12', shade) : C.paper; g.fillRect(L - 9, -14, 12, 28); }
+      g.restore();
+      inkPath(g, pts, sd, 0.7); inkStroke(g, 2.3, lineC);
+      if (cuff) { g.beginPath(); g.moveTo(L - 9, -8); g.lineTo(L - 9, 8); g.strokeStyle = lineC; g.lineWidth = 1.4; g.stroke(); }
+    };
+    inFrame(g, el, angle(sub(ha, el)), () => paintSleeve(Lf, sleeve(Lf, 10.5, 8, seed), seed + 3, true));
+    inFrame(g, sh, angle(sub(el, sh)), () => paintSleeve(Lu, sleeve(Lu, 14, 11, seed), seed + 2, false));
+    // shoulder cap merging into the torso
+    g.beginPath(); g.arc(sh.x, sh.y, 13, 0, Math.PI * 2);
+    g.fillStyle = cloth; g.fill();
+    g.save(); g.clip(); g.fillStyle = stripe; g.fillRect(sh.x - 2, sh.y - 14, 4, 28); g.restore();
+  }
+
+  function headPts() {
+    return [[2, -27], [19, -19], [24, -3], [19, 12], [10, 20], [-4, 26], [-12, 27.5], [-19, 23], [-20, 18],
+            [-22, 14], [-21, 9], [-29, 4.5], [-23, -4], [-25, -10], [-22, -19], [-13, -25]];
+  }
+  // drawHead(): angular adult profile; the face is modelled by hard
+  // graphic shadow shapes (noir chiaroscuro) rather than drawn features.
+  function drawHead(g, r) {
+    const nb = r.neck, hb = add(r.head, V(4, 22));
+    inFrame(g, nb, angle(sub(hb, nb)), () => {
+      const L = len(sub(hb, nb));
+      const pts = [[-5, 14], [L + 4, 11], [L + 4, -12], [-5, -15]];
+      inkPath(g, pts, 41, 0.5); g.fillStyle = C.skin; g.fill();
+      g.save(); g.clip(); g.fillStyle = '#120f0d'; g.fillRect(-8, -18, L + 14, 17); g.restore();
+      inkPath(g, pts, 41, 0.5); inkStroke(g, 2.2);
+    });
+    inFrame(g, r.head, r.headTilt, () => {
+      g.scale(HEAD_S, HEAD_S);
+      const pts = headPts();
+      inkPath(g, pts, 42, 0.4);
+      g.fillStyle = C.skin; g.fill();
+      g.save(); g.clip();
+      // deep shadow: side of the face, jaw, under the brow
+      g.fillStyle = '#120f0d';
+      inkPath(g, [[-11, -30], [30, -30], [30, 32], [-10, 32], [-7, 22], [-12, 14], [-8, 4], [-12, -4], [-9, -12]], 43, 0.8); g.fill();
+      inkPath(g, [[-25, -9], [-12, -10], [-10, -4], [-16, -2], [-23, -4]], 46, 0.4); g.fill();      // eye socket
+      inkPath(g, [[-23, 8], [-15, 9], [-13, 12], [-21, 12]], 47, 0.3); g.fill();                     // under the nose
+      inkPath(g, [[-19, 21], [-11, 20], [-8, 27], [-17, 27]], 48, 0.4); g.fill();                    // under the chin
+      // one lit crescent along the profile (forehead → nose → lips → chin)
+      g.fillStyle = C.skinLit;
+      inkPath(g, [[-21, -20], [-24.5, -10], [-22.5, -4], [-28.5, 4.5], [-21.5, 9], [-21.5, 14], [-19.5, 22],
+                  [-15, 21], [-16.5, 15], [-16, 9.5], [-20, 4], [-18.5, -3], [-19.5, -10], [-16, -19]], 44, 0.25);
+      g.fill();
+      g.restore();
+      inkPath(g, pts, 42, 0.4); inkStroke(g, 2.3);
+      // heavy brow, lowered lid looking down at the ball
+      g.beginPath(); g.moveTo(-25, -10); g.quadraticCurveTo(-18, -13.5, -10, -10.5);
+      g.strokeStyle = INK; g.lineWidth = 3.2; g.stroke();
+      g.beginPath(); g.moveTo(-21, -5); g.quadraticCurveTo(-17, -3.5, -13, -5);
+      g.strokeStyle = 'rgba(210,200,188,0.8)'; g.lineWidth = 1; g.stroke();
+      // mouth, nasolabial fold
+      g.beginPath(); g.moveTo(-21, 15.5); g.lineTo(-16, 16);
+      g.strokeStyle = INK; g.lineWidth = 1.6; g.stroke();
+      g.beginPath(); g.moveTo(-17, 8); g.quadraticCurveTo(-15, 12, -16, 15); g.lineWidth = 1; g.stroke();
+      // ear, rim-lit inside the shadow
+      g.beginPath(); g.ellipse(6, 1, 4.5, 7.5, 0.15, 0, Math.PI * 2);
+      g.fillStyle = '#1b1714'; g.fill(); g.strokeStyle = 'rgba(160,150,140,0.45)'; g.lineWidth = 1; g.stroke();
+      drawHair(g);
+    });
+  }
+  // drawHair(): pomaded, slicked-back 1940s cut with a side part.
+  function drawHair(g) {
+    const pts = [[-22, -18], [-19, -29], [-6, -36], [10, -35], [23, -26], [27, -9], [25, 6], [18, 14],
+                 [12, 7], [11, -4], [2, -8], [0, 2], [-4, 3], [-6, -8], [-13, -15]];
+    inkPath(g, pts, 51, 0.6);
+    g.fillStyle = '#050505'; g.fill();
+    g.save(); g.clip();
+    // pomade sheen: thin combed streaks + one cold highlight band
+    g.strokeStyle = 'rgba(190,198,206,0.2)'; g.lineWidth = 0.9; g.lineCap = 'round';
+    for (let i = 0; i < 4; i++) {
+      g.beginPath(); g.moveTo(-18 + i * 2.5, -22 - i * 1.3); g.quadraticCurveTo(2 + i * 2.5, -33 + i * 1.4, 24, -14 + i * 3.4); g.stroke();
+    }
+    g.strokeStyle = 'rgba(111,140,168,0.45)'; g.lineWidth = 2.4;
+    g.beginPath(); g.moveTo(-14, -27); g.quadraticCurveTo(4, -35, 22, -22); g.stroke();
+    g.restore();
+    inkPath(g, pts, 51, 0.6); inkStroke(g, 2.2);
+    g.beginPath(); g.moveTo(-10, -30); g.quadraticCurveTo(0, -32, 12, -30);              // side part
+    g.strokeStyle = 'rgba(200,205,210,0.55)'; g.lineWidth = 1; g.stroke();
+  }
+
+  // drawBall(): 1940s laced leather ball.
+  function drawBall(g, b) {
+    const lift = Math.max(0, BALL_REST.y - b.y);
+    g.beginPath();
+    g.ellipse(b.x + lift * 0.1, GROUND_Y + 1, Math.max(8, BALL_R + 4 - lift * 0.08), 5.5, 0, 0, Math.PI * 2);
+    g.fillStyle = `rgba(0,0,0,${0.9 - Math.min(0.6, lift / 300)})`; g.fill();
+    g.save();
+    g.translate(b.x, b.y);
+    g.scale(1 - b.squash, 1 + b.squash * 0.6);
+    g.beginPath(); g.arc(0, 0, BALL_R, 0, Math.PI * 2);
+    const grd = g.createRadialGradient(-9, -10, 3, 0, 0, BALL_R);
+    grd.addColorStop(0, '#ece6d8'); grd.addColorStop(0.6, '#b9b1a1'); grd.addColorStop(1, '#4a453d');
+    g.fillStyle = grd; g.fill();
+    g.save(); g.clip();
+    g.rotate(b.rot);
+    // panel seams
+    g.strokeStyle = 'rgba(20,18,16,0.85)'; g.lineWidth = 1.4;
+    for (const [a0, a1, rr] of [[-0.3, 1.9, 0.62], [2.1, 4.2, 0.62], [4.4, 6.0, 0.62]]) {
+      g.beginPath(); g.arc(0, 0, BALL_R * rr, a0, a1); g.stroke();
+    }
+    for (let i = 0; i < 6; i++) {
+      const a = i * Math.PI / 3 + 0.2;
+      g.beginPath(); g.moveTo(Math.cos(a) * BALL_R * 0.62, Math.sin(a) * BALL_R * 0.62);
+      g.lineTo(Math.cos(a) * BALL_R * 1.1, Math.sin(a) * BALL_R * 1.1); g.stroke();
+    }
+    // lacing slit
+    g.strokeStyle = '#2a2622'; g.lineWidth = 2.2;
+    g.beginPath(); g.moveTo(-7, -16); g.lineTo(7, -16); g.stroke();
+    g.strokeStyle = '#e9e3d6'; g.lineWidth = 1;
+    for (let x = -6; x <= 6; x += 3) { g.beginPath(); g.moveTo(x, -18); g.lineTo(x + 1.5, -14); g.stroke(); }
+    // leather speckle
+    for (let i = 0; i < 26; i++) {
+      g.fillStyle = `rgba(30,26,22,${0.15 + (jitter(9, i) + 0.5) * 0.3})`;
+      g.fillRect(jitter(3, i) * BALL_R * 1.7, jitter(4, i) * BALL_R * 1.7, 1.4, 1.4);
+    }
+    g.restore();
+    // shadow terminator
+    g.beginPath(); g.arc(0, 0, BALL_R, -0.6, 2.2);
+    g.arc(7, 7, BALL_R * 0.95, 2.1, -0.5, true); g.closePath();
+    g.fillStyle = 'rgba(0,0,0,0.45)'; g.fill();
+    g.beginPath(); g.arc(0, 0, BALL_R, 0, Math.PI * 2); inkStroke(g, 2.4);
+    g.restore();
+  }
+
+  // Motion trail — only once the ball has been struck.
+  function drawBallTrail(g, t) {
+    if (t <= T_CONTACT) return;
+    g.save(); g.lineCap = 'round';
+    for (let k = 1; k <= 7; k++) {
+      const tt = t - k * 0.022;
+      if (tt <= T_CONTACT) break;
+      const p = ballState(tt), q = ballState(tt + 0.022);
+      const a = 0.35 * (1 - k / 8);
+      for (const off of [-0.55, 0, 0.55]) {
+        const n = norm(V(-(q.y - p.y), q.x - p.x));
+        g.beginPath();
+        g.moveTo(p.x + n.x * off * BALL_R, p.y + n.y * off * BALL_R);
+        g.lineTo(q.x + n.x * off * BALL_R, q.y + n.y * off * BALL_R);
+        g.strokeStyle = off === 0 ? `rgba(201,162,74,${a * 0.8})` : `rgba(233,229,220,${a})`;
+        g.lineWidth = off === 0 ? 2 : 1.4; g.stroke();
+      }
+    }
+    g.restore();
+  }
+  function drawImpact(g, t) {
+    const dt = t - T_CONTACT;
+    if (dt < 0 || dt > 0.12) return;
+    const k = dt / 0.12, c = add(BALL_REST, V(BALL_R * 0.86, BALL_R * 0.5));
+    g.save(); g.globalAlpha = 1 - k; g.lineCap = 'round';
+    for (let i = 0; i < 9; i++) {
+      const a = -0.4 + i * 0.45, r0 = 10 + k * 10, r1 = 26 + k * 22 + (i % 2) * 8;
+      g.beginPath(); g.moveTo(c.x + Math.cos(a) * r0, c.y + Math.sin(a) * r0);
+      g.lineTo(c.x + Math.cos(a) * r1, c.y + Math.sin(a) * r1);
+      g.strokeStyle = i === 3 ? C.gold : C.paper; g.lineWidth = i === 3 ? 2.4 : 1.5; g.stroke();
+    }
+    g.restore();
+  }
+
+  // =================================================================
+  //  BACKGROUND (painted once)
+  // =================================================================
+  const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+  const grain = document.createElement('canvas'); grain.width = W; grain.height = H;
+  let seedBG = 5;
+  const rnd = () => (seedBG = (seedBG * 16807) % 2147483647) / 2147483647;
+
+  // drawBrushStrokes(): a dry-brush sweep made of broken bristle lines.
+  function drawBrushStrokes(g, x0, y0, cx, cy, x1, y1, width, color, alpha) {
+    const bristles = Math.max(4, Math.round(width / 1.2));
+    const nx = -(y1 - y0), ny = x1 - x0, nl = Math.hypot(nx, ny) || 1;
+    for (let b = 0; b < bristles; b++) {
+      const f = b / (bristles - 1) - 0.5, off = f * width;
+      const ox = nx / nl * off, oy = ny / nl * off;
+      const start = rnd() * 0.18 + Math.abs(f) * 0.2, end = 1 - rnd() * 0.25 - Math.abs(f) * 0.15;
+      g.strokeStyle = color; g.globalAlpha = alpha * (0.45 + rnd() * 0.55);
+      g.lineWidth = 1.2 + rnd() * 2.4; g.lineCap = 'round';
+      g.beginPath();
+      let pen = false;
+      for (let u = start; u <= end; u += 0.012) {
+        const A = (1 - u) * (1 - u), B = 2 * (1 - u) * u, Cq = u * u;
+        const x = A * x0 + B * cx + Cq * x1 + ox, y = A * y0 + B * cy + Cq * y1 + oy;
+        if (rnd() < 0.03) { pen = false; continue; }
+        if (!pen) { g.moveTo(x, y); pen = true; } else g.lineTo(x, y);
+      }
+      g.stroke();
+    }
+    g.globalAlpha = 1;
+  }
+  function drawBackground() {
+    const g = bg.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+    // faint cold haze behind the player
+    const haze = g.createRadialGradient(640, 420, 40, 640, 420, 520);
+    haze.addColorStop(0, 'rgba(40,56,74,0.28)'); haze.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = haze; g.fillRect(0, 0, W, H);
+    // restrained blue brushwork: a ground sweep, a rising slash right, a thin echo left
+    drawBrushStrokes(g, -40, 648, 380, 612, 1320, 640, 34, '#3e5670', 0.55);
+    drawBrushStrokes(g, 60, 676, 520, 652, 1180, 690, 16, '#56708c', 0.45);
+    drawBrushStrokes(g, 860, 600, 1040, 520, 1300, 330, 46, '#3e5670', 0.5);
+    drawBrushStrokes(g, 940, 590, 1110, 500, 1290, 390, 12, '#6d88a3', 0.45);
+    drawBrushStrokes(g, -30, 470, 120, 430, 330, 440, 14, '#3e5670', 0.4);
+    // a few splatters
+    g.fillStyle = '#56708c';
+    for (let i = 0; i < 38; i++) {
+      const cx = i < 22 ? 900 + rnd() * 360 : 40 + rnd() * 380, cy = i < 22 ? 380 + rnd() * 260 : 420 + rnd() * 200;
+      g.globalAlpha = 0.35 + rnd() * 0.5;
+      g.beginPath(); g.arc(cx, cy, 0.8 + Math.pow(rnd(), 3) * 5, 0, Math.PI * 2); g.fill();
+    }
+    g.globalAlpha = 1;
+    // very subtle gold accents
+    drawBrushStrokes(g, 20, 560, 300, 540, 560, 556, 2.5, '#c9a24a', 0.35);
+    drawBrushStrokes(g, 1000, 468, 1130, 420, 1260, 350, 2, '#c9a24a', 0.3);
+    // vignette
+    const v = g.createRadialGradient(640, 380, 260, 640, 380, 820);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.75)');
+    g.fillStyle = v; g.fillRect(0, 0, W, H);
+    // print grain (static, overlaid on every frame)
+    const gg = grain.getContext('2d'), img = gg.createImageData(W, H);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const n = rnd() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = n; img.data[i + 3] = 14;
+    }
+    gg.putImageData(img, 0, 0);
+  }
+  drawBackground();
+
+  // =================================================================
+  //  FRAME — explicit depth order, back to front:
+  //   background → far arm → KICK LEG (+ its shorts tube, + the support
+  //   leg's cast shadow) → SUPPORT LEG (ink knockout, leg, shorts tube)
+  //   → shirt → shorts waist → head → near arm → ball
+  // =================================================================
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const layer = document.createElement('canvas'); layer.width = W; layer.height = H;
+  const lg = layer.getContext('2d');
+  const state = { t: 0, playing: true, speed: 1, debug: false };
+
+  function render(t) {
+    const at = Math.min(Math.max(t, 0), DURATION);
+    const r = sampleRig(at), b = ballState(at);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(bg, 0, 0);
+    const VIEW = [VIEW_S, 0, 0, VIEW_S, VIEW_PIVOT.x * (1 - VIEW_S), VIEW_PIVOT.y * (1 - VIEW_S)];
+    ctx.setTransform(...VIEW);
+    // contact shadow of the planted foot
+    ctx.beginPath(); ctx.ellipse(r.sFoot.x - 14, GROUND_Y + 1, 42, 6, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.9)'; ctx.fill();
+
+    drawArm(ctx, r.fSh, r.fEl, r.fHa, true, 61);
+
+    // KICK LEG — FIRST (behind)
+    lg.setTransform(1, 0, 0, 1, 0, 0); lg.clearRect(0, 0, W, H); lg.setTransform(...VIEW);
+    drawLeg(lg, r.kHip, r.kKnee, r.kAnk, r.kToe, KICK_STYLE, 101);
+    drawShortsTube(lg, r.kHip, r.kKnee, r.kToe, KICK_STYLE, 111);
+    lg.save(); lg.globalCompositeOperation = 'source-atop'; lg.globalAlpha = 0.55;
+    lg.translate(9, 3);
+    drawLeg(lg, r.sHip, r.sKnee, r.sFoot, r.sToe, LEG_STYLE, 201, 'silhouette');   // shadow cast onto it
+    lg.restore();
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(layer, 0, 0); ctx.setTransform(...VIEW);
+
+    // SUPPORT LEG — SECOND (in front): black knockout rim, then the leg
+    drawLeg(ctx, r.sHip, r.sKnee, r.sFoot, r.sToe, LEG_STYLE, 201, 'knockout');
+    drawLeg(ctx, r.sHip, r.sKnee, r.sFoot, r.sToe, LEG_STYLE, 201);
+    drawShortsTube(ctx, r.sHip, r.sKnee, r.sToe, LEG_STYLE, 211);
+
+    drawTorso(ctx, r);
+    drawShirt(ctx, r);
+    drawShortsWaist(ctx, r);
+    drawHead(ctx, r);
+    drawArm(ctx, r.nSh, r.nEl, r.nHa, false, 71);
+
+    drawBallTrail(ctx, at);
+    drawBall(ctx, b);
+    drawImpact(ctx, at);
+    if (state.debug) drawJoints(r, at);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(grain, 0, 0);
+  }
+
+  function drawJoints(r, t) {
+    const dot = (p, c) => { ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill(); };
+    ['sHip', 'sKnee', 'sFoot'].forEach(k => dot(r[k], '#fff'));
+    ['kHip', 'kKnee', 'kAnk'].forEach(k => dot(r[k], '#6fb2ee'));
+    dot(add(r.kAnk, r.kToe), '#c9a24a');
+    const a = analyze(t);
+    ctx.fillStyle = '#e9e5dc'; ctx.font = '14px Helvetica Neue, Arial';
+    ctx.fillText(`t ${t.toFixed(2)}  shins cross: ${a.shinsCross ? 'YES' : 'no'}  kick foot: ${a.kickFootSide}  toe→ball ${a.toeGap.toFixed(1)}px`, 20, 28);
+  }
+
+  // =================================================================
+  //  ANALYSIS (used for automated QC)
+  // =================================================================
+  function segX(p1, p2, p3, p4) {
+    const d = (p2.x - p1.x) * (p4.y - p3.y) - (p2.y - p1.y) * (p4.x - p3.x);
+    if (Math.abs(d) < 1e-9) return null;
+    const u = ((p3.x - p1.x) * (p4.y - p3.y) - (p3.y - p1.y) * (p4.x - p3.x)) / d;
+    const v = ((p3.x - p1.x) * (p2.y - p1.y) - (p3.y - p1.y) * (p2.x - p1.x)) / d;
+    return (u >= 0 && u <= 1 && v >= 0 && v <= 1) ? V(p1.x + u * (p2.x - p1.x), p1.y + u * (p2.y - p1.y)) : null;
+  }
+  function analyze(t) {
+    const r = sampleRig(t), b = ballState(t);
+    const side = p => ((r.sFoot.x - r.sKnee.x) * (p.y - r.sKnee.y) - (r.sFoot.y - r.sKnee.y) * (p.x - r.sKnee.x)) < 0 ? 'kick side' : 'ball side';
+    const toe = add(r.kAnk, r.kToe);
+    return {
+      t, supportFoot: r.sFoot, shinsCross: !!segX(r.kKnee, r.kAnk, r.sKnee, r.sFoot),
+      kickFootSide: side(r.kAnk), toe, toeGap: len(sub(toe, V(b.x, b.y))) - BALL_R,
+      legs: 2, drawOrder: ['KICK LEG', 'SUPPORT LEG'],
+      thigh: [len(sub(r.sKnee, r.sHip)), len(sub(r.kKnee, r.kHip))],
+      shin: [len(sub(r.sFoot, r.sKnee)), len(sub(r.kAnk, r.kKnee))],
+    };
+  }
+
+  // =================================================================
+  //  PLAYBACK
+  // =================================================================
+  const $ = id => document.getElementById(id);
+  const ui = { play: $('play'), slow: $('slow'), debug: $('debug'), scrub: $('scrub'), tl: $('tlabel') };
+  function syncUI() {
+    ui.play.textContent = state.playing ? 'Pause' : 'Play';
+    ui.play.setAttribute('aria-pressed', state.playing);
+    ui.slow.setAttribute('aria-pressed', state.speed !== 1);
+    ui.debug.setAttribute('aria-pressed', state.debug);
+    ui.scrub.value = Math.min(state.t, DURATION);
+    ui.tl.textContent = Math.min(state.t, DURATION).toFixed(2) + ' s';
+  }
+  ui.play.onclick = () => { state.playing = !state.playing; syncUI(); };
+  ui.slow.onclick = () => { state.speed = state.speed === 1 ? 0.25 : 1; syncUI(); };
+  ui.debug.onclick = () => { state.debug = !state.debug; render(state.t); syncUI(); };
+  ui.scrub.oninput = () => { state.t = +ui.scrub.value; state.playing = false; render(state.t); syncUI(); };
+  addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' && e.key !== ' ') return;
+    if (e.key === ' ') { e.preventDefault(); ui.play.onclick(); }
+    else if (e.key === 'ArrowRight') { state.playing = false; state.t = Math.min(DURATION, state.t + 1 / 30); render(state.t); syncUI(); }
+    else if (e.key === 'ArrowLeft') { state.playing = false; state.t = Math.max(0, state.t - 1 / 30); render(state.t); syncUI(); }
+  });
+  const q = new URLSearchParams(location.search);
+  if (q.has('t')) { state.t = +q.get('t'); state.playing = false; }
+  if (q.has('debug')) state.debug = true;
+  if (q.has('slow')) state.speed = 0.25;
+
+  let last = null;
+  function tick(now) {
+    if (last !== null && state.playing) {
+      state.t += Math.min(0.05, (now - last) / 1000) * state.speed;
+      if (state.t > DURATION + LOOP_HOLD) state.t = 0;
+      syncUI();
+    }
+    last = now;
+    render(state.t);
+    requestAnimationFrame(tick);
+  }
+  syncUI(); render(state.t);
+  if (!q.has('export')) requestAnimationFrame(tick);
+
+  window.rabona = {
+    DURATION, T_CONTACT, KEYS, sampleRig, ballState, analyze,
+    renderAt(t) { state.t = t; state.playing = false; render(t); return true; },
+    frame(t) { render(t); return cv.toDataURL('image/png'); },
+  };
+})();
+</script>
+</body>
+</html>
