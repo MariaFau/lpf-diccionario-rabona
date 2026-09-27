@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>La Rabona</title>
+<style>
+  :root { --bg: #000; --ink: #efe6d2; --dim: #8b8f94; --gold: #e2bd62; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--ink);
+    font: 13px/1.4 "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.05em;
+  }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; overflow: hidden;
+  }
+  .stage { width: min(100%, calc((100vh - 90px) * 16 / 9)); aspect-ratio: 16 / 9; }
+  canvas { display: block; width: 100%; height: 100%; background: #000; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--dim);
+    width: min(100%, calc((100vh - 90px) * 16 / 9));
+  }
+  .controls button {
+    background: none; border: 1px solid #33383d; color: var(--ink); padding: 5px 10px;
+    font: inherit; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+  }
+  .controls button[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }
+  .controls input[type=range] { flex: 1; min-width: 160px; accent-color: #3c96e6; }
+  .controls .t { font-variant-numeric: tabular-nums; min-width: 52px; color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div class="controls">
+  <button id="play" aria-pressed="true">Pause</button>
+  <button id="slow" aria-pressed="false">0.25×</button>
+  <input id="scrub" type="range" min="0" max="2.4" step="0.001" value="0">
+  <span class="t" id="tlabel">0.00 s</span>
+  <span>space · ← →</span>
+</div>
+<script src="assets/personaje-sprites.js"></script>
+<script>
+(async () => {
+  'use strict';
+
+  // =================================================================
+  //  APPROVED MOTION — copied verbatim from rabona.html (the biomechanical
+  //  reference). Do not edit here; tools/check_motion.js verifies that
+  //  both pages produce identical joints, ball path and timing.
+  // =================================================================
+  // ---------------------------------------------------------------
+  //  Scene constants (canvas space is fixed at 1920x1080, camera static)
+  // ---------------------------------------------------------------
+  const W = 1920, H = 1080;
+  const DURATION = 2.4;       // the animation itself
+  const LOOP_HOLD = 0.9;      // pause on the last frame before looping
+  const GROUND_Y = 900;
+
+  // Player faces screen-left, chest turned 3/4 toward camera.
+  // Left-footed rabona:
+  //   SUPPORT leg = player's RIGHT leg (screen-left), foot never moves.
+  //   KICK leg    = player's LEFT leg (screen-right), always drawn on the
+  //                 layer BEHIND the support leg.
+  const SUPPORT_ANKLE = { x: 955, y: 870 };
+  const SUPPORT_TOE   = { x: -60, y: 16 };   // boot direction (toe vector)
+  const THIGH = 160, SHIN = 160;              // support leg segment lengths (IK)
+  const HIP_HALF = 34;                        // half pelvis width
+
+  const BALL_REST = { x: 762, y: 870 };
+  const BALL_R = 30;
+  const T_CONTACT = 1.66;
+
+  const COL = {
+    ink: '#ece9e2',
+    inkSoft: '#b9b6ae',
+    gray: '#8a9097',
+    blue: '#5b6b7a',
+    blueDeep: '#1f2934',
+    blueFill: '#2b3845',
+    blueLine: '#9fb2c4',
+    gold: '#c9a84a',
+    black: '#050505',
+  };
+
+  // ---------------------------------------------------------------
+  //  Key poses. Kick leg is driven by explicit knee + ankle waypoints
+  //  (NOT a rotation around the hip), so the foot follows a routed path
+  //  that goes around the back of the support shin.
+  //
+  //  Fields:
+  //   pelvis      pelvis centre
+  //   neck        base of neck
+  //   kKnee/kAnk  kick-leg knee and ankle
+  //   kToe        kick boot direction vector
+  //   fShoulder.. far arm (player's left, screen-right)
+  //   nShoulder.. near arm (player's right, screen-left)
+  // ---------------------------------------------------------------
+  const P = (x, y) => ({ x, y });
+
+  const POSE_A = {
+    name: 'A', label: 'PREPARATION',
+    pelvis: P(1000, 555), neck: P(982, 330),
+    kKnee: P(1078, 712), kAnk: P(1138, 858), kToe: P(-38, 36),
+    fElbow: P(1098, 420), fHand: P(1140, 500),
+    nElbow: P(900, 420), nHand: P(850, 495),
+  };
+  // Back-lift: heel rises behind the body, still on the kick-leg side.
+  const POSE_LIFT = {
+    name: 'lift',
+    pelvis: P(1002, 560), neck: P(990, 334),
+    kKnee: P(1096, 690), kAnk: P(1226, 752), kToe: P(-14, 52),
+    fElbow: P(1110, 380), fHand: P(1190, 350),
+    nElbow: P(885, 405), nHand: P(812, 440),
+  };
+  // From here to contact the kick ankle travels along ONE continuous line:
+  //   approach → behind the support shin → emerged on the ball side → ball.
+  // All four ankle positions lie on  contact + k·(1, -0.45),  so the foot
+  // never changes course after it comes out from behind the support leg.
+  const STRIKE_LINE = (k) => P(846 + k, 850 - 0.45 * k);
+
+  // Approach: ankle arrives at the back edge of the support shin.
+  const POSE_APPROACH = {
+    name: 'approach',
+    pelvis: P(1004, 563), neck: P(996, 336),
+    kKnee: P(1066, 692), kAnk: STRIKE_LINE(154), kToe: P(-44, 38),
+    fElbow: P(1118, 370), fHand: P(1205, 335),
+    nElbow: P(880, 400), nHand: P(800, 425),
+  };
+  // POSE B — LEG CROSSING BEHIND: ankle directly behind the support shin.
+  const POSE_B = {
+    name: 'B', label: 'LEG CROSSING BEHIND',
+    pelvis: P(1005, 565), neck: P(998, 337),
+    kKnee: P(1020, 705), kAnk: STRIKE_LINE(94), kToe: P(-50, 28),
+    fElbow: P(1120, 369), fHand: P(1209, 332),
+    nElbow: P(877, 399), nHand: P(796, 421),
+  };
+  // POSE C — CROSSED POSITION: shins form an X, boot out on the ball side.
+  const POSE_C = {
+    name: 'C', label: 'CROSSED POSITION',
+    pelvis: P(1006, 566), neck: P(1000, 338),
+    kKnee: P(995, 722), kAnk: STRIKE_LINE(44), kToe: P(-54, 24),
+    fElbow: P(1122, 368), fHand: P(1212, 330),
+    nElbow: P(875, 398), nHand: P(792, 418),
+  };
+  // POSE D — CONTACT: the same foot, still on the same line, meets the ball.
+  const POSE_D = {
+    name: 'D', label: 'CONTACT',
+    pelvis: P(1004, 569), neck: P(999, 340),
+    kKnee: P(975, 735), kAnk: STRIKE_LINE(0), kToe: P(-54, 22),
+    fElbow: P(1125, 372), fHand: P(1215, 340),
+    nElbow: P(872, 402), nHand: P(788, 430),
+  };
+  // Follow-through: foot keeps going along the line, then decelerates.
+  const POSE_FOLLOW = {
+    name: 'follow',
+    pelvis: P(1002, 569), neck: P(997, 340),
+    kKnee: P(966, 738), kAnk: STRIKE_LINE(-32), kToe: P(-54, 18),
+    fElbow: P(1120, 376), fHand: P(1208, 352),
+    nElbow: P(876, 405), nHand: P(794, 438),
+  };
+  const POSE_SETTLE = {
+    name: 'settle',
+    pelvis: P(1000, 568), neck: P(995, 339),
+    kKnee: P(964, 732), kAnk: P(806, 852), kToe: P(-55, 10),
+    fElbow: P(1115, 382), fHand: P(1198, 368),
+    nElbow: P(880, 408), nHand: P(800, 445),
+  };
+
+  // Timeline. `flat` = zero velocity at that key (a hold). No holds between
+  // the approach and the follow-through: the foot never stops before contact.
+  const KEYS = [
+    { t: 0.00, pose: POSE_A, flat: true },
+    { t: 0.50, pose: POSE_A, flat: true },
+    { t: 0.70, pose: POSE_LIFT },
+    { t: 0.92, pose: POSE_APPROACH },
+    { t: 1.14, pose: POSE_B },
+    { t: 1.40, pose: POSE_C },
+    { t: 1.66, pose: POSE_D },
+    { t: 1.90, pose: POSE_FOLLOW },
+    { t: 2.40, pose: POSE_SETTLE, flat: true },
+  ];
+  // Keyframe-sheet moments
+  const SHEET = [
+    { t: 0.40, id: 'A', label: 'PREPARATION' },
+    { t: 1.14, id: 'B', label: 'LEG CROSSING BEHIND' },
+    { t: 1.40, id: 'C', label: 'CROSSED POSITION' },
+    { t: 1.66, id: 'D', label: 'CONTACT' },
+    { t: 1.80, id: 'E', label: 'BALL LEAVING THE FOOT' },
+  ];
+  const POINT_FIELDS = Object.keys(POSE_A).filter(k => typeof POSE_A[k] === 'object');
+
+  // ---------------------------------------------------------------
+  //  Interpolation: non-uniform cubic Hermite (Catmull-Rom tangents
+  //  scaled by real key spacing) so the path is smooth through waypoints.
+  // ---------------------------------------------------------------
+  function tangent(i, f, axis) {
+    const k = KEYS[i];
+    if (k.flat || i === 0 || i === KEYS.length - 1) return 0;
+    const a = KEYS[i - 1], b = KEYS[i + 1];
+    const m = (b.pose[f][axis] - a.pose[f][axis]) / (b.t - a.t);
+    return m * (k.damp ?? 1);
+  }
+  function hermite(p0, p1, m0, m1, dt, u) {
+    const u2 = u * u, u3 = u2 * u;
+    return (2*u3 - 3*u2 + 1) * p0 + (u3 - 2*u2 + u) * dt * m0
+         + (-2*u3 + 3*u2) * p1 + (u3 - u2) * dt * m1;
+  }
+  function sampleRig(t) {
+    t = Math.max(0, Math.min(DURATION, t));
+    let i = 0;
+    while (i < KEYS.length - 2 && t > KEYS[i + 1].t) i++;
+    const a = KEYS[i], b = KEYS[i + 1];
+    const dt = b.t - a.t;
+    const u = dt > 0 ? (t - a.t) / dt : 0;
+    const rig = {};
+    for (const f of POINT_FIELDS) {
+      rig[f] = {
+        x: hermite(a.pose[f].x, b.pose[f].x, tangent(i, f, 'x'), tangent(i + 1, f, 'x'), dt, u),
+        y: hermite(a.pose[f].y, b.pose[f].y, tangent(i, f, 'y'), tangent(i + 1, f, 'y'), dt, u),
+      };
+    }
+    return solveRig(rig);
+  }
+
+  // ---------------------------------------------------------------
+  //  Rig solve: derived joints + support-leg IK (ankle is pinned).
+  // ---------------------------------------------------------------
+  const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+  const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+  const mul = (a, s) => ({ x: a.x * s, y: a.y * s });
+  const len = a => Math.hypot(a.x, a.y);
+  const norm = a => { const l = len(a) || 1; return { x: a.x / l, y: a.y / l }; };
+  const lerpP = (a, b, u) => ({ x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u });
+
+  function twoBoneIK(hip, ankle, l1, l2, bendSign) {
+    const d = sub(ankle, hip);
+    let dist = Math.min(len(d), l1 + l2 - 0.01);
+    const dir = norm(d);
+    const a = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist);
+    const h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+    const perp = { x: -dir.y * bendSign, y: dir.x * bendSign };
+    return add(add(hip, mul(dir, a)), mul(perp, h));
+  }
+
+  function solveRig(r) {
+    // pelvis tilts slightly as weight drops onto the support leg
+    const tilt = (r.pelvis.y - 555) * 0.004;
+    const across = { x: Math.cos(tilt), y: Math.sin(tilt) };
+    r.sHip = sub(r.pelvis, mul(across, HIP_HALF));     // support (screen-left)
+    r.kHip = add(r.pelvis, mul(across, HIP_HALF));     // kick (screen-right)
+    r.sAnk = { ...SUPPORT_ANKLE };                     // PINNED — never animated
+    r.sToe = SUPPORT_TOE;
+    // knee bends forward = toward screen-left
+    r.sKnee = twoBoneIK(r.sHip, r.sAnk, THIGH, SHIN, 1);
+    const spine = norm(sub(r.neck, r.pelvis));
+    const right = { x: -spine.y, y: spine.x };          // screen-right across the torso
+    r.fShoulder = add(r.neck, add(mul(right, 50), mul(spine, -18)));
+    r.nShoulder = add(r.neck, add(mul(right, -46), mul(spine, -14)));
+    r.head = add(r.neck, add(mul(spine, 62), { x: -14, y: 0 }));
+    return r;
+  }
+
+  // ---------------------------------------------------------------
+  //  Ball
+  // ---------------------------------------------------------------
+  function ballState(t) {
+    if (t <= T_CONTACT) return { x: BALL_REST.x, y: BALL_REST.y, rot: 0, squash: 0, moving: false, p: 0 };
+    const p = Math.min(1, (t - T_CONTACT) / (DURATION - T_CONTACT));
+    const e = 1 - Math.pow(1 - p, 1.6);
+    const x = BALL_REST.x - 640 * e;
+    const y = BALL_REST.y - 250 * Math.sin(e * Math.PI * 0.62);
+    const squash = Math.max(0, 1 - (t - T_CONTACT) / 0.07) * 0.18;
+    return { x, y, rot: -e * 11, squash, moving: true, p };
+  }
+
+  // =================================================================
+  //  END OF APPROVED MOTION
+  // =================================================================
+
+  // Back-to-front order used by the renderer (the approved draw order).
+  const LAYERS = ['background', 'KICK LEG', 'SUPPORT LEG', 'upper body', 'ball'];
+  const layerIndex = name => LAYERS.indexOf(name);
+  // ---------------------------------------------------------------
+  //  Analysis helpers (used by debug overlay and automated checks)
+  // ---------------------------------------------------------------
+  function segIntersect(p1, p2, p3, p4) {
+    const d = (p2.x - p1.x) * (p4.y - p3.y) - (p2.y - p1.y) * (p4.x - p3.x);
+    if (Math.abs(d) < 1e-9) return null;
+    const u = ((p3.x - p1.x) * (p4.y - p3.y) - (p3.y - p1.y) * (p4.x - p3.x)) / d;
+    const v = ((p3.x - p1.x) * (p2.y - p1.y) - (p3.y - p1.y) * (p2.x - p1.x)) / d;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    return { x: p1.x + u * (p2.x - p1.x), y: p1.y + u * (p2.y - p1.y) };
+  }
+  // Signed side of point p relative to the support leg line (hip→ankle).
+  // > 0 = kick side (screen-right / behind), < 0 = ball side.
+  function sideOfSupport(r, p) {
+    const a = r.sKnee, b = r.sAnk;
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) < 0 ? 1 : -1;
+  }
+  function analyze(t) {
+    const r = sampleRig(t);
+    const shinX = segIntersect(r.kKnee, r.kAnk, r.sKnee, r.sAnk);
+    const toe = add(r.kAnk, mul(norm(r.kToe), len(r.kToe)));
+    return {
+      t,
+      supportAnkle: r.sAnk,
+      shinsCross: !!shinX,
+      crossPoint: shinX,
+      kickLayer: layerIndex('KICK LEG') < layerIndex('SUPPORT LEG') ? 'behind' : 'IN FRONT',
+      kickFootSide: sideOfSupport(r, r.kAnk) > 0 ? 'kick side' : 'ball side',
+      kickKneeSide: sideOfSupport(r, r.kKnee) > 0 ? 'kick side' : 'ball side',
+      toe,
+      toeToBall: Math.hypot(toe.x - BALL_REST.x, toe.y - BALL_REST.y) - BALL_R,
+    };
+  }
+
+
+  // ---------------------------------------------------------------
+  //  Artwork: pieces cut from references/personaje.png
+  //  (tools/cut_sprites.js). ART_* are joints in the source illustration.
+  // ---------------------------------------------------------------
+  const S = 0.73;                       // illustration px → canvas px
+  const ART = {
+    hip:   P(888, 390),                 // front (right) hip, hidden under the shorts
+    knee:  P(866, 605),
+    ankle: P(872, 830),
+    toe:   P(763, 862),                 // tip of the boot
+    ballC: P(635, 800), ballR: 69,
+  };
+  // Upper-body pivot = pelvis centre in illustration space.
+  ART.pelvis = P(ART.hip.x + HIP_HALF / S, ART.hip.y);
+  const SPINE_A = Math.atan2(POSE_A.neck.y - POSE_A.pelvis.y, POSE_A.neck.x - POSE_A.pelvis.x);
+
+  const SPR = {};
+  for (const [k, v] of Object.entries(window.PERSONAJE_SPRITES)) {
+    const img = new Image(); img.src = v.src; await img.decode();
+    SPR[k] = { ...v, img };
+  }
+  function variant(name, paint) {
+    const s = SPR[name];
+    const c = document.createElement('canvas'); c.width = s.w; c.height = s.h;
+    const g = c.getContext('2d');
+    g.drawImage(s.img, 0, 0);
+    g.globalCompositeOperation = 'source-atop';
+    paint(g, s.w, s.h);
+    return c;
+  }
+  const LEG_PIECES = ['thigh', 'shin', 'boot'];
+  for (const k of LEG_PIECES) {
+    // far leg: pushed into shadow, cooler, like the illustration's deep blacks
+    SPR[k].far = variant(k, (g, w, h) => { g.fillStyle = 'rgba(6, 14, 30, 0.4)'; g.fillRect(0, 0, w, h); });
+    SPR[k].rim = variant(k, (g, w, h) => { g.fillStyle = '#6fb2ee'; g.fillRect(0, 0, w, h); });
+    SPR[k].ink = variant(k, (g, w, h) => { g.fillStyle = '#000'; g.fillRect(0, 0, w, h); });
+  }
+
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+
+  // Place an illustration piece so its art joints a1→a2 land on rig joints
+  // r1→r2 (length along the limb is fitted; width keeps the art scale).
+  function placeSeg(g, a1, a2, r1, r2) {
+    const aA = Math.atan2(a2.y - a1.y, a2.x - a1.x), aL = Math.hypot(a2.x - a1.x, a2.y - a1.y);
+    const rA = Math.atan2(r2.y - r1.y, r2.x - r1.x), rL = Math.hypot(r2.x - r1.x, r2.y - r1.y);
+    g.translate(r1.x, r1.y);
+    g.rotate(rA);
+    g.scale(rL / aL, S);
+    g.rotate(-aA);
+    g.translate(-a1.x, -a1.y);
+  }
+  function drawPiece(g, name, a1, a2, r1, r2, which, offset) {
+    const s = SPR[name];
+    g.save();
+    if (offset) g.translate(offset.x, offset.y);
+    placeSeg(g, a1, a2, r1, r2);
+    g.drawImage(which === 'far' ? s.far : which === 'ink' ? s.ink : which === 'rim' ? s.rim : s.img, s.x, s.y);
+    g.restore();
+  }
+  // One whole leg: sock, boot, then thigh over the knee joint.
+  function drawLegArt(g, hip, knee, ank, toeVec, which, offset) {
+    const toe = add(ank, toeVec);
+    drawPiece(g, 'shin', ART.knee, ART.ankle, knee, ank, which, offset);
+    drawPiece(g, 'boot', ART.ankle, ART.toe, ank, toe, which, offset);
+    drawPiece(g, 'thigh', ART.hip, ART.knee, hip, knee, which, offset);
+  }
+
+  function drawUpper(g, r) {
+    const s = SPR.upper;
+    const spin = Math.atan2(r.neck.y - r.pelvis.y, r.neck.x - r.pelvis.x) - SPINE_A;
+    g.save();
+    g.translate(r.pelvis.x, r.pelvis.y);
+    g.rotate(spin);
+    g.scale(S, S);
+    g.translate(-ART.pelvis.x, -ART.pelvis.y);
+    g.drawImage(s.img, s.x, s.y);
+    g.restore();
+  }
+
+  // ---------------------------------------------------------------
+  //  Background — black, blue dry-brush sweeps, splatter, restrained gold
+  // ---------------------------------------------------------------
+  const bg = document.createElement('canvas');
+  bg.width = W; bg.height = H;
+  (function paintBackground() {
+    const g = bg.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+    let seed = 11;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const BLUES = ['#3c96e6', '#2f84d6', '#57a9ee', '#1f63ad'];
+
+    // dry brush: many thin bristle lines along a curve, broken randomly
+    function brush(x0, y0, cx, cy, x1, y1, width, color, alpha) {
+      const bristles = Math.max(4, Math.round(width / 1.1));
+      for (let b = 0; b < bristles; b++) {
+        const off = (b / (bristles - 1) - 0.5) * width;
+        const nx = -(y1 - y0), ny = x1 - x0, nl = Math.hypot(nx, ny) || 1;
+        const ox = nx / nl * off, oy = ny / nl * off;
+        const start = rnd() * 0.25, end = 1 - rnd() * 0.3;
+        g.strokeStyle = color;
+        g.globalAlpha = alpha * (0.55 + rnd() * 0.45);
+        g.lineWidth = 1.6 + rnd() * 3.2;
+        g.beginPath();
+        let pen = false;
+        for (let u = start; u <= end; u += 0.01) {
+          const a = (1 - u) * (1 - u), bq = 2 * (1 - u) * u, c = u * u;
+          const x = a * x0 + bq * cx + c * x1 + ox, y = a * y0 + bq * cy + c * y1 + oy;
+          if (rnd() < 0.02) { pen = false; continue; }   // gaps in the bristle
+          if (!pen) { g.moveTo(x, y); pen = true; } else g.lineTo(x, y);
+        }
+        g.stroke();
+      }
+      g.globalAlpha = 1;
+    }
+    function splatter(cx, cy, spread, n, color) {
+      g.fillStyle = color;
+      for (let i = 0; i < n; i++) {
+        const a = rnd() * Math.PI * 2, d = Math.pow(rnd(), 1.8) * spread;
+        const r = 0.8 + Math.pow(rnd(), 3) * 9;
+        g.globalAlpha = 0.6 + rnd() * 0.4;
+        g.beginPath(); g.arc(cx + Math.cos(a) * d, cy + Math.sin(a) * d * 0.6, r, 0, Math.PI * 2); g.fill();
+      }
+      g.globalAlpha = 1;
+    }
+
+    // left mid-band sweeps
+    for (let i = 0; i < 9; i++) {
+      const y = 360 + rnd() * 240;
+      brush(-60, y + 40, 120, y - 30 - rnd() * 60, 300 + rnd() * 160, y - 140 - rnd() * 80,
+        16 + rnd() * 30, BLUES[i % 4], 0.8);
+    }
+    // right rising sweeps (the illustration's diagonal slashes)
+    for (let i = 0; i < 16; i++) {
+      const x = 1180 + rnd() * 700, y = 560 + rnd() * 200;
+      brush(x - 380, y + 90, x - 120, y + 10, x + 260, y - 260 - rnd() * 160,
+        14 + rnd() * 46, BLUES[i % 4], 0.85);
+    }
+    // ground band: long horizontal strokes
+    for (let i = 0; i < 26; i++) {
+      const y = 720 + rnd() * 250;
+      brush(-80 + rnd() * 300, y + rnd() * 30, 700 + rnd() * 400, y - 50 + rnd() * 40,
+        1500 + rnd() * 600, y - 20 - rnd() * 110, 10 + rnd() * 44, BLUES[i % 4], 0.78);
+    }
+    // cream highlights on the ground plane
+    for (let i = 0; i < 5; i++) {
+      const y = 928 + rnd() * 70;
+      brush(-40, y, 500 + rnd() * 300, y - 22, 1100 + rnd() * 500, y - 30 - rnd() * 40,
+        4 + rnd() * 8, '#efe6d2', 0.75);
+    }
+    // restrained gold streaks
+    brush(-40, 610, 420, 560, 900, 612, 5, '#e2bd62', 0.7);
+    brush(1180, 760, 1500, 700, 1920, 640, 4, '#e2bd62', 0.65);
+    brush(1350, 480, 1560, 420, 1780, 330, 3, '#e2bd62', 0.55);
+    // splatter
+    splatter(260, 520, 260, 90, '#3c96e6');
+    splatter(1500, 560, 380, 120, '#3c96e6');
+    splatter(900, 840, 700, 160, '#57a9ee');
+    splatter(1600, 280, 200, 30, '#57a9ee');
+    // black ink scratches over the paint
+    g.strokeStyle = '#000';
+    for (let i = 0; i < 160; i++) {
+      const x = rnd() * W, y = 700 + rnd() * 380, L = 20 + rnd() * 160;
+      g.globalAlpha = 0.5 + rnd() * 0.5; g.lineWidth = 1 + rnd() * 3;
+      g.beginPath(); g.moveTo(x, y); g.lineTo(x + L, y - L * (0.05 + rnd() * 0.15)); g.stroke();
+    }
+    g.globalAlpha = 1;
+    // print grain
+    const img = g.getImageData(0, 0, W, H), d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const n = (rnd() - 0.5) * 18;
+      d[i] += n; d[i + 1] += n; d[i + 2] += n;
+    }
+    g.putImageData(img, 0, 0);
+    const v = g.createRadialGradient(W / 2, H * 0.55, H * 0.4, W / 2, H * 0.55, H * 1.1);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.7)');
+    g.fillStyle = v; g.fillRect(0, 0, W, H);
+  })();
+
+  // ---------------------------------------------------------------
+  //  Kick-leg layer: far leg + motion smear + the support leg's shadow on it
+  // ---------------------------------------------------------------
+  const kickLayer = document.createElement('canvas');
+  kickLayer.width = W; kickLayer.height = H;
+  const kg = kickLayer.getContext('2d');
+
+  function drawSmear(g, t) {
+    if (t < 0.56 || t > 1.9) return;
+    const t0 = Math.max(0.5, t - 0.2), steps = 18;
+    g.save();
+    g.lineCap = 'round';
+    for (const [dx, dy, a] of [[0, 0, 0.55], [6, -10, 0.35], [-4, 12, 0.3]]) {
+      g.beginPath();
+      for (let i = 0; i <= steps; i++) {
+        const r = sampleRig(t0 + (t - t0) * i / steps);
+        const p = add(r.kAnk, mul(r.kToe, 0.55));
+        if (i) g.lineTo(p.x + dx, p.y + dy); else g.moveTo(p.x + dx, p.y + dy);
+      }
+      g.strokeStyle = `rgba(239,230,210,${a})`;
+      g.lineWidth = 2;
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  function renderKickLayer(r, t) {
+    kg.setTransform(1, 0, 0, 1, 0, 0);
+    kg.clearRect(0, 0, W, H);
+    drawSmear(kg, t);
+    // cool rim light from the blue environment separates the far leg's
+    // black sock from the support leg's black ink edge
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * Math.PI * 2;
+      drawLegArt(kg, r.kHip, r.kKnee, r.kAnk, r.kToe, 'rim', { x: Math.cos(a) * 2.5, y: Math.sin(a) * 2.5 });
+    }
+    drawLegArt(kg, r.kHip, r.kKnee, r.kAnk, r.kToe, 'far');
+    // the support leg casts its shadow onto the leg behind it
+    kg.save();
+    kg.globalCompositeOperation = 'source-atop';
+    kg.globalAlpha = 0.6;
+    drawLegArt(kg, r.sHip, r.sKnee, r.sAnk, r.sToe, 'ink', { x: 20, y: 6 });
+    kg.restore();
+  }
+
+  // ---------------------------------------------------------------
+  //  Ball, speed lines, impact
+  // ---------------------------------------------------------------
+  function drawBall(b) {
+    const lift = Math.max(0, BALL_REST.y - b.y);
+    ctx.beginPath();
+    ctx.ellipse(b.x + lift * 0.1, GROUND_Y + 2, Math.max(10, 36 - lift * 0.08), 7, 0, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,0,0,${0.9 - Math.min(0.6, lift / 400)})`; ctx.fill();
+    const s = SPR.ball, k = BALL_R / ART.ballR;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.scale(1 - b.squash, 1 + b.squash * 0.6);
+    ctx.rotate(b.rot);
+    ctx.scale(k, k);
+    ctx.drawImage(s.img, s.x - ART.ballC.x, s.y - ART.ballC.y);
+    ctx.restore();
+  }
+  function drawSpeedLines(b, t) {
+    if (!b.moving) return;
+    const fade = Math.min(1, (t - T_CONTACT) / 0.06) * (1 - b.p * 0.6);
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 7; i++) {
+      const off = (i - 3) * 8.5, L = 70 + (i % 3) * 45;
+      ctx.beginPath();
+      ctx.moveTo(b.x + 36, b.y + off);
+      ctx.lineTo(b.x + 36 + L, b.y + off + L * 0.28);
+      ctx.lineWidth = i === 3 ? 2.6 : 1.5;
+      ctx.strokeStyle = i === 3 ? `rgba(226,189,98,${0.85 * fade})` : `rgba(239,230,210,${0.7 * fade})`;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawImpact(t) {
+    const dt = t - T_CONTACT;
+    if (dt < 0 || dt > 0.14) return;
+    const k = dt / 0.14, c = { x: BALL_REST.x + BALL_R, y: BALL_REST.y };
+    ctx.save();
+    ctx.globalAlpha = 1 - k;
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 11; i++) {
+      const a = -Math.PI * 0.98 + i * (Math.PI * 1.15 / 10);
+      const r0 = 26 + k * 18, r1 = 58 + k * 44 + (i % 2) * 20;
+      ctx.beginPath();
+      ctx.moveTo(c.x + Math.cos(a) * r0, c.y + Math.sin(a) * r0);
+      ctx.lineTo(c.x + Math.cos(a) * r1, c.y + Math.sin(a) * r1);
+      ctx.lineWidth = i % 3 === 1 ? 4 : 2;
+      ctx.strokeStyle = i % 3 === 1 ? '#e2bd62' : '#efe6d2';
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------
+  //  Frame — explicit back-to-front order (see LAYERS)
+  // ---------------------------------------------------------------
+  function render(t) {
+    const at = Math.min(t, DURATION);
+    const r = sampleRig(at);
+    const b = ballState(at);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // background
+    ctx.drawImage(bg, 0, 0);
+    ctx.beginPath(); ctx.ellipse(r.sAnk.x - 18, GROUND_Y + 4, 78, 10, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fill();
+    // KICK LEG (always behind)
+    renderKickLayer(r, at);
+    ctx.drawImage(kickLayer, 0, 0);
+    // SUPPORT LEG: ink knockout rim, then the leg itself
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * Math.PI * 2;
+      drawLegArt(ctx, r.sHip, r.sKnee, r.sAnk, r.sToe, 'ink', { x: Math.cos(a) * 6, y: Math.sin(a) * 6 });
+    }
+    drawLegArt(ctx, r.sHip, r.sKnee, r.sAnk, r.sToe, 'art');
+    // upper body (shorts cover both thighs)
+    drawUpper(ctx, r);
+    // ball
+    drawSpeedLines(b, at);
+    drawBall(b);
+    drawImpact(at);
+  }
+
+  // ---------------------------------------------------------------
+  //  Keyframe sheet (?sheet=1)
+  // ---------------------------------------------------------------
+  function renderSheet() {
+    const PW = 560, GAP = 30, M = 60, ROW1 = 620, ROW2 = 560, HEAD = 200;
+    const SW = M * 2 + PW * 5 + GAP * 4, SH = HEAD + ROW1 + 24 + ROW2 + 70;
+    const sheet = document.createElement('canvas'); sheet.width = SW; sheet.height = SH;
+    const g = sheet.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, SW, SH);
+    g.fillStyle = '#8b8f94'; g.font = '500 26px Helvetica Neue, Arial';
+    g.fillText('LA RABONA  ·  FINAL CHARACTER ON THE APPROVED A–E KEY POSES', M, 70);
+    g.fillStyle = '#efe6d2'; g.font = '600 32px Helvetica Neue, Arial';
+    g.fillText('Support leg planted and in front · kick leg crosses behind it and strikes on one continuous line', M, 118);
+    SHEET.forEach((k, i) => {
+      const x = M + i * (PW + GAP);
+      render(k.t);
+      g.drawImage(cv, 500, 150, 820, 908, x, HEAD, PW, ROW1);
+      g.strokeStyle = '#26292c'; g.lineWidth = 2; g.strokeRect(x, HEAD, PW, ROW1);
+      g.fillStyle = '#e2bd62'; g.font = '700 46px Helvetica Neue, Arial'; g.fillText(k.id, x + 2, HEAD - 18);
+      g.fillStyle = '#efe6d2'; g.font = '600 24px Helvetica Neue, Arial'; g.fillText(k.label, x + 46, HEAD - 24);
+      g.fillStyle = '#8b8f94'; g.font = '500 20px Helvetica Neue, Arial'; g.fillText(k.t.toFixed(2) + ' s', x + PW - 70, HEAD - 24);
+      const y2 = HEAD + ROW1 + 24;
+      g.drawImage(cv, 700, 560, 480, 480, x, y2, PW, ROW2);
+      g.strokeStyle = '#26292c'; g.strokeRect(x, y2, PW, ROW2);
+      g.fillStyle = '#8b8f94'; g.font = '500 18px Helvetica Neue, Arial'; g.fillText('LEGS · 1.17×', x + 14, y2 + 28);
+    });
+    render(state.t);
+    return sheet;
+  }
+
+  // ---------------------------------------------------------------
+  //  Playback
+  // ---------------------------------------------------------------
+  const state = { t: 0, playing: true, speed: 1 };
+  const $ = id => document.getElementById(id);
+  const ui = { play: $('play'), slow: $('slow'), scrub: $('scrub'), tl: $('tlabel') };
+  ui.scrub.max = DURATION;
+  function syncUI() {
+    ui.play.textContent = state.playing ? 'Pause' : 'Play';
+    ui.play.setAttribute('aria-pressed', state.playing);
+    ui.slow.setAttribute('aria-pressed', state.speed !== 1);
+    ui.scrub.value = Math.min(state.t, DURATION);
+    ui.tl.textContent = Math.min(state.t, DURATION).toFixed(2) + ' s';
+  }
+  ui.play.onclick = () => { state.playing = !state.playing; syncUI(); };
+  ui.slow.onclick = () => { state.speed = state.speed === 1 ? 0.25 : 1; syncUI(); };
+  ui.scrub.oninput = () => { state.t = +ui.scrub.value; state.playing = false; render(state.t); syncUI(); };
+  addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' && e.key !== ' ') return;
+    if (e.key === ' ') { e.preventDefault(); ui.play.onclick(); }
+    else if (e.key === 'ArrowRight') { state.playing = false; state.t = Math.min(DURATION, state.t + 1 / 30); render(state.t); syncUI(); }
+    else if (e.key === 'ArrowLeft') { state.playing = false; state.t = Math.max(0, state.t - 1 / 30); render(state.t); syncUI(); }
+  });
+
+  const q = new URLSearchParams(location.search);
+  if (q.has('slow')) state.speed = 0.25;
+  if (q.has('t')) { state.t = +q.get('t'); state.playing = false; }
+
+  let last = null;
+  function tick(now) {
+    if (last !== null && state.playing) {
+      state.t += Math.min(0.05, (now - last) / 1000) * state.speed;
+      if (state.t > DURATION + LOOP_HOLD) state.t = 0;
+      syncUI();
+    }
+    last = now;
+    render(state.t);
+    requestAnimationFrame(tick);
+  }
+  syncUI();
+  render(state.t);
+  if (q.has('sheet')) {
+    const sheet = renderSheet();
+    sheet.style.cssText = 'width:100%;height:auto;display:block';
+    document.body.style.overflow = 'auto';
+    document.body.style.justifyContent = 'flex-start';
+    const stage = document.querySelector('.stage');
+    stage.style.aspectRatio = 'auto'; stage.style.width = '100%';
+    stage.replaceChildren(sheet);
+    document.querySelector('.controls').remove();
+  } else {
+    requestAnimationFrame(tick);
+  }
+
+  window.rabona = {
+    setTime(t) { state.t = t; state.playing = false; render(t); syncUI(); },
+    sampleRig, analyze, ballState, KEYS, SHEET, ready: true,
+    sheetDataURL() { return renderSheet().toDataURL('image/png'); },
+  };
+})();
+</script>
+</body>
+</html>
