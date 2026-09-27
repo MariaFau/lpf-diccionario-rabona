@@ -73,7 +73,7 @@
   <button id="slow" aria-pressed="false">0.25×</button>
   <button id="debug" aria-pressed="false">Debug</button>
   <button id="ghost" aria-pressed="false">Ghosts</button>
-  <input id="scrub" type="range" min="0" max="2.2" step="0.001" value="0">
+  <input id="scrub" type="range" min="0" max="2.4" step="0.001" value="0">
   <span class="t" id="tlabel">0.00 s</span>
   <span class="keys">space · ← → · S · D · G</span>
 </div>
@@ -85,7 +85,7 @@
   //  Scene constants (canvas space is fixed at 1920x1080, camera static)
   // ---------------------------------------------------------------
   const W = 1920, H = 1080;
-  const DURATION = 2.2;       // the animation itself
+  const DURATION = 2.4;       // the animation itself
   const LOOP_HOLD = 0.9;      // pause on the last frame before looping
   const GROUND_Y = 900;
 
@@ -101,7 +101,7 @@
 
   const BALL_REST = { x: 762, y: 870 };
   const BALL_R = 30;
-  const T_CONTACT = 1.6;
+  const T_CONTACT = 1.66;
 
   const COL = {
     ink: '#ece9e2',
@@ -145,60 +145,80 @@
     fElbow: P(1110, 380), fHand: P(1190, 350),
     nElbow: P(885, 405), nHand: P(812, 440),
   };
+  // From here to contact the kick ankle travels along ONE continuous line:
+  //   approach → behind the support shin → emerged on the ball side → ball.
+  // All four ankle positions lie on  contact + k·(1, -0.45),  so the foot
+  // never changes course after it comes out from behind the support leg.
+  const STRIKE_LINE = (k) => P(846 + k, 850 - 0.45 * k);
+
   // Approach: ankle arrives at the back edge of the support shin.
   const POSE_APPROACH = {
     name: 'approach',
     pelvis: P(1004, 563), neck: P(996, 336),
-    kKnee: P(1052, 700), kAnk: P(996, 790), kToe: P(-44, 38),
+    kKnee: P(1066, 692), kAnk: STRIKE_LINE(154), kToe: P(-44, 38),
     fElbow: P(1118, 370), fHand: P(1205, 335),
     nElbow: P(880, 400), nHand: P(800, 425),
   };
-  // Behind: ankle directly behind the support shin (hidden by it).
-  const POSE_BEHIND = {
-    name: 'behind',
+  // POSE B — LEG CROSSING BEHIND: ankle directly behind the support shin.
+  const POSE_B = {
+    name: 'B', label: 'LEG CROSSING BEHIND',
     pelvis: P(1005, 565), neck: P(998, 337),
-    kKnee: P(1018, 704), kAnk: P(930, 790), kToe: P(-52, 24),
+    kKnee: P(1020, 705), kAnk: STRIKE_LINE(94), kToe: P(-50, 28),
     fElbow: P(1120, 369), fHand: P(1209, 332),
     nElbow: P(877, 399), nHand: P(796, 421),
   };
-  // POSE B — CROSSING. Shins form an X; kick shin hidden by support shin
-  // at the crossing, kick boot already out on the far (ball) side.
-  const POSE_B = {
-    name: 'B', label: 'CROSSING',
+  // POSE C — CROSSED POSITION: shins form an X, boot out on the ball side.
+  const POSE_C = {
+    name: 'C', label: 'CROSSED POSITION',
     pelvis: P(1006, 566), neck: P(1000, 338),
-    kKnee: P(1000, 704), kAnk: P(868, 790), kToe: P(-56, 14),
+    kKnee: P(995, 722), kAnk: STRIKE_LINE(44), kToe: P(-54, 24),
     fElbow: P(1122, 368), fHand: P(1212, 330),
     nElbow: P(875, 398), nHand: P(792, 418),
   };
-  // POSE C — CONTACT. Kick toe meets the right side of the ball, shin
-  // still passing behind the support shin.
-  const POSE_C = {
-    name: 'C', label: 'CONTACT',
-    pelvis: P(1002, 570), neck: P(998, 340),
-    kKnee: P(990, 724), kAnk: P(846, 850), kToe: P(-54, 22),
+  // POSE D — CONTACT: the same foot, still on the same line, meets the ball.
+  const POSE_D = {
+    name: 'D', label: 'CONTACT',
+    pelvis: P(1004, 569), neck: P(999, 340),
+    kKnee: P(975, 735), kAnk: STRIKE_LINE(0), kToe: P(-54, 22),
     fElbow: P(1125, 372), fHand: P(1215, 340),
     nElbow: P(872, 402), nHand: P(788, 430),
   };
+  // Follow-through: foot keeps going along the line, then decelerates.
   const POSE_FOLLOW = {
-    name: 'follow', label: 'FOLLOW-THROUGH',
-    pelvis: P(1000, 568), neck: P(994, 338),
-    kKnee: P(996, 706), kAnk: P(818, 806), kToe: P(-55, -6),
+    name: 'follow',
+    pelvis: P(1002, 569), neck: P(997, 340),
+    kKnee: P(966, 738), kAnk: STRIKE_LINE(-32), kToe: P(-54, 18),
+    fElbow: P(1120, 376), fHand: P(1208, 352),
+    nElbow: P(876, 405), nHand: P(794, 438),
+  };
+  const POSE_SETTLE = {
+    name: 'settle',
+    pelvis: P(1000, 568), neck: P(995, 339),
+    kKnee: P(964, 732), kAnk: P(806, 852), kToe: P(-55, 10),
     fElbow: P(1115, 382), fHand: P(1198, 368),
     nElbow: P(880, 408), nHand: P(800, 445),
   };
 
-  // Timeline. `flat` = zero velocity at that key (a hold).
+  // Timeline. `flat` = zero velocity at that key (a hold). No holds between
+  // the approach and the follow-through: the foot never stops before contact.
   const KEYS = [
     { t: 0.00, pose: POSE_A, flat: true },
     { t: 0.50, pose: POSE_A, flat: true },
-    { t: 0.68, pose: POSE_LIFT },
-    { t: 0.86, pose: POSE_APPROACH },
-    { t: 0.98, pose: POSE_BEHIND },
-    { t: 1.10, pose: POSE_B, flat: true },    // B held still 1.1–1.3 for inspection
-    { t: 1.30, pose: POSE_B, flat: true },
-    { t: 1.60, pose: POSE_C },
-    { t: 1.85, pose: POSE_FOLLOW },
-    { t: 2.20, pose: POSE_FOLLOW, flat: true },
+    { t: 0.70, pose: POSE_LIFT },
+    { t: 0.92, pose: POSE_APPROACH },
+    { t: 1.14, pose: POSE_B },
+    { t: 1.40, pose: POSE_C },
+    { t: 1.66, pose: POSE_D },
+    { t: 1.90, pose: POSE_FOLLOW },
+    { t: 2.40, pose: POSE_SETTLE, flat: true },
+  ];
+  // Keyframe-sheet moments
+  const SHEET = [
+    { t: 0.40, id: 'A', label: 'PREPARATION' },
+    { t: 1.14, id: 'B', label: 'LEG CROSSING BEHIND' },
+    { t: 1.40, id: 'C', label: 'CROSSED POSITION' },
+    { t: 1.66, id: 'D', label: 'CONTACT' },
+    { t: 1.80, id: 'E', label: 'BALL LEAVING THE FOOT' },
   ];
   const POINT_FIELDS = Object.keys(POSE_A).filter(k => typeof POSE_A[k] === 'object');
 
@@ -649,7 +669,7 @@
   // hidden where it passes behind the support leg.
   function drawKickTrail(t) {
     const t0 = Math.max(0.5, t - 0.28);
-    if (t <= 0.52 || t > 2.1) return;
+    if (t <= 0.52 || t > 2.3) return;
     const steps = 22;
     ctx.save();
     ctx.lineCap = 'round';
@@ -700,6 +720,7 @@
     ['kick trail',  (r, t, alpha) => { if (alpha === 1) drawKickTrail(t); }],
     ['KICK LEG',    r => drawLeg(r.kHip, r.kKnee, r.kAnk, r.kToe, KICK_STYLE)],
     ['cast shadow', r => drawCastShadow(r)],
+    ['ankle path',  () => { if (state.pathT != null) drawAnklePath(state.pathT); }],
     ['SUPPORT LEG', r => drawLeg(r.sHip, r.sKnee, r.sAnk, r.sToe, SUPPORT_STYLE)],
     ['shorts',      r => drawShorts(r)],
     ['torso',       r => drawTorso(r)],
@@ -800,11 +821,11 @@
 
   function phaseOf(t) {
     if (t < 0.5) return 'A — PREPARATION';
-    if (t < 1.1) return 'A → B — KICK LEG CROSSES BEHIND THE SUPPORT LEG';
-    if (t < 1.3) return 'B — CROSSED BEHIND';
-    if (t < 1.6) return 'B → C — FOOT STRIKES FROM BEHIND';
-    if (t < 1.7) return 'C — CONTACT';
-    return 'BALL FLIGHT';
+    if (t < 1.02) return 'KICK LEG SWINGS ACROSS THE BODY';
+    if (t < 1.27) return 'B — LEG CROSSING BEHIND THE SUPPORT LEG';
+    if (t < 1.58) return 'C — CROSSED POSITION · FOOT EMERGES ON THE BALL SIDE';
+    if (t < 1.74) return 'D — CONTACT';
+    return 'E — BALL LEAVES THE FOOT';
   }
 
   function drawHUD(t) {
@@ -820,7 +841,7 @@
     ctx.strokeStyle = '#3a434c'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
     const X = tt => x0 + (x1 - x0) * tt / DURATION;
-    [[0.0, 'A'], [1.1, 'B'], [T_CONTACT, 'C']].forEach(([tt, n]) => {
+    SHEET.map(k => [k.t, k.id]).forEach(([tt, n]) => {
       ctx.fillStyle = COL.gray;
       ctx.fillRect(X(tt) - 1, y - 10, 2, 20);
       ctx.font = '600 16px Helvetica Neue, Arial';
@@ -835,7 +856,7 @@
   //  Frame
   // ---------------------------------------------------------------
   const state = {
-    t: 0, playing: true, speed: 1, debug: false, ghosts: false,
+    t: 0, playing: true, speed: 1, debug: false, ghosts: false, hud: true, pathT: null,
   };
 
   function render(t) {
@@ -845,7 +866,7 @@
     const r = sampleRig(at);
     const b = ballState(at);
     if (state.ghosts) {
-      for (const [gt] of [[0.5], [1.2], [T_CONTACT]]) {
+      for (const [gt] of [[0.5], [1.40], [T_CONTACT]]) {
         if (Math.abs(gt - at) > 0.05) drawCharacter(sampleRig(gt), gt, 0.16);
       }
     }
@@ -856,7 +877,109 @@
     drawBall(b);
     drawImpact(at);
     if (state.debug) drawDebug(r, at);
-    drawHUD(at);
+    if (state.hud) drawHUD(at);
+  }
+
+  // ---------------------------------------------------------------
+  //  Keyframe sheet (?sheet=1): full-body row + leg close-up row
+  // ---------------------------------------------------------------
+  const SHEET_NOTES = {
+    A: 'Support foot planted beside the ball. Kick leg on its own side, behind the body.',
+    B: 'Kick ankle passes directly behind the support shin and is hidden by it.',
+    C: 'Shins form an X. Boot is out on the ball side, still travelling on the strike line.',
+    D: 'Same foot, same line: the toe meets the ball. Kick shin is still behind.',
+    E: 'Ball leaves the foot at once; the foot carries on along the same line.',
+  };
+
+  function drawAnklePath(tNow) {
+    ctx.save();
+    ctx.lineCap = 'round';
+    let prev = null;
+    for (let i = 0; i <= 240; i++) {
+      const tt = 0.5 + (1.9 - 0.5) * i / 240;
+      const rr = sampleRig(tt);
+      const p = rr.kAnk;
+      if (prev) {
+        ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(p.x, p.y);
+        ctx.setLineDash(tt <= tNow ? [] : [5, 6]);
+        ctx.lineWidth = tt <= tNow ? 2.6 : 1.6;
+        ctx.strokeStyle = sideOfSupport(rr, p) > 0 ? 'rgba(159,178,196,0.95)' : 'rgba(201,168,74,0.95)';
+        ctx.stroke();
+      }
+      prev = p;
+    }
+    ctx.setLineDash([]);
+    const r = sampleRig(Math.min(tNow, 1.9));
+    ctx.beginPath(); ctx.arc(r.kAnk.x, r.kAnk.y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = COL.gold; ctx.fill();
+    ctx.restore();
+  }
+  function drawCrossRing(tNow) {
+    const a = analyze(tNow);
+    if (!a.crossPoint) return;
+    ctx.beginPath(); ctx.arc(a.crossPoint.x, a.crossPoint.y, 14, 0, Math.PI * 2);
+    ctx.lineWidth = 2; ctx.strokeStyle = COL.gold; ctx.stroke();
+  }
+
+  function wrapText(g, text, x, y, maxW, lh) {
+    let line = '';
+    for (const w of text.split(' ')) {
+      const test = line ? line + ' ' + w : w;
+      if (g.measureText(test).width > maxW && line) { g.fillText(line, x, y); line = w; y += lh; }
+      else line = test;
+    }
+    if (line) g.fillText(line, x, y);
+  }
+
+  function renderSheet() {
+    const PW = 560, GAP = 30, M = 60;
+    const SW = M * 2 + PW * 5 + GAP * 4;           // 3020
+    const ROW1 = 620, ROW2 = 560, HEAD = 280, CAP = 150;
+    const SH = HEAD + ROW1 + 24 + ROW2 + CAP + 40;
+    const sheet = document.createElement('canvas');
+    sheet.width = SW; sheet.height = SH;
+    const g = sheet.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, SW, SH);
+    g.fillStyle = COL.gray; g.font = '500 26px Helvetica Neue, Arial';
+    g.fillText('RABONA  ·  BIOMECHANICAL KEYFRAME SHEET  ·  TECHNICAL REFERENCE', M, 70);
+    g.fillStyle = COL.ink; g.font = '600 34px Helvetica Neue, Arial';
+    g.fillText('Left-footed rabona — support (right) leg in front and pinned; kick (left) leg passes behind it and strikes on one continuous line', M, 120);
+    // legend
+    g.font = '500 22px Helvetica Neue, Arial';
+    const lx = M, ly = 156;
+    g.fillStyle = COL.ink; g.fillText('■ support leg (front layer)', lx, ly);
+    g.fillStyle = COL.blueLine; g.fillText('■ kick leg (back layer)', lx + 330, ly);
+    g.fillStyle = COL.blueLine; g.fillText('— ankle path, kick side', lx + 640, ly);
+    g.fillStyle = COL.gold; g.fillText('— ankle path, ball side (only reached by passing behind)   · solid = travelled, dashed = still to come', lx + 930, ly);
+    g.fillStyle = COL.gold; g.fillText('○ shins cross (support shin in front)', lx, ly + 34);
+
+    const prevHud = state.hud, prevDbg = state.debug, prevGh = state.ghosts;
+    state.hud = false; state.debug = false; state.ghosts = false;
+    SHEET.forEach((k, i) => {
+      const x = M + i * (PW + GAP);
+      // row 1: full body
+      render(k.t);
+      g.drawImage(cv, 520, 190, 740, 820, x, HEAD, PW, ROW1);
+      g.strokeStyle = '#2a323a'; g.lineWidth = 2; g.strokeRect(x, HEAD, PW, ROW1);
+      g.fillStyle = COL.gold; g.font = '700 46px Helvetica Neue, Arial'; g.fillText(k.id, x + 2, HEAD - 16);
+      g.fillStyle = COL.ink; g.font = '600 24px Helvetica Neue, Arial'; g.fillText(k.label, x + 46, HEAD - 22);
+      g.fillStyle = COL.gray; g.font = '500 20px Helvetica Neue, Arial'; g.fillText(k.t.toFixed(2) + ' s', x + PW - 70, HEAD - 22);
+      // row 2: legs close-up with ankle path
+      state.pathT = k.t;
+      render(k.t);
+      state.pathT = null;
+      drawCrossRing(k.t);
+      const y2 = HEAD + ROW1 + 24;
+      g.drawImage(cv, 720, 560, 460, 460, x, y2, PW, ROW2);
+      g.strokeStyle = '#2a323a'; g.strokeRect(x, y2, PW, ROW2);
+      g.fillStyle = COL.gray; g.font = '500 18px Helvetica Neue, Arial'; g.fillText('LEGS · 1.2×', x + 14, y2 + 28);
+      // caption
+      g.fillStyle = COL.ink; g.font = '500 23px Helvetica Neue, Arial';
+      wrapText(g, SHEET_NOTES[k.id], x + 4, y2 + ROW2 + 40, PW - 8, 31);
+    });
+    state.hud = prevHud; state.debug = prevDbg; state.ghosts = prevGh;
+    render(state.t);
+    return sheet;
   }
 
   // ---------------------------------------------------------------
@@ -908,12 +1031,25 @@
   }
   syncUI();
   render(state.t);
-  requestAnimationFrame(tick);
+  if (q.has('sheet')) {
+    const sheet = renderSheet();
+    sheet.style.cssText = 'width:100%;height:auto;display:block';
+    document.body.style.overflow = 'auto';
+    document.body.style.justifyContent = 'flex-start';
+    const stage = document.querySelector('.stage');
+    stage.style.aspectRatio = 'auto';
+    stage.style.width = '100%';
+    stage.replaceChildren(sheet);
+    document.querySelector('.controls').remove();
+  } else {
+    requestAnimationFrame(tick);
+  }
 
   // Hooks for automated inspection
   window.rabona = {
     setTime(t) { state.t = t; state.playing = false; render(t); syncUI(); },
-    sampleRig, analyze, ballState, KEYS,
+    sampleRig, analyze, ballState, KEYS, SHEET,
+    sheetDataURL() { return renderSheet().toDataURL('image/png'); },
   };
 })();
 </script>
